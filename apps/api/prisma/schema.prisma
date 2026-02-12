@@ -1,0 +1,140 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Tenant {
+  id                     String                 @id
+  plan                   String
+  createdAt              DateTime               @default(now())
+  users                  User[]
+  devices                Device[]
+  events                 Event[]
+  incidents              Incident[]
+  notificationChannels   NotificationChannel[]
+  notificationDeliveries NotificationDelivery[]
+}
+
+model User {
+  id        String   @id
+  tenantId  String
+  createdAt DateTime @default(now())
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  devices Device[]
+
+  // ✅ Add this line (inverse relation for Event.user)
+  events Event[]
+}
+
+model Device {
+  id        String   @id
+  tenantId  String
+  userId    String
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+  events    Event[]
+}
+
+model Event {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  deviceId  String
+  type      String
+  url       String
+  hostname  String
+  risk      Int
+  verdict   String
+  reasons   String[]
+  ts        DateTime
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User   @relation(fields: [userId], references: [id])
+  device Device @relation(fields: [deviceId], references: [id])
+
+  @@index([tenantId, ts])
+  @@index([tenantId, hostname])
+  @@index([tenantId, verdict])
+}
+
+model Incident {
+  id          String   @id @default(cuid())
+  tenantId    String
+  hostname    String
+  verdict     String
+  maxRisk     Int
+  reasons     String[]
+  firstSeenAt DateTime
+  lastSeenAt  DateTime
+  eventCount  Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, hostname, verdict])
+  @@index([tenantId, lastSeenAt])
+}
+
+enum NotificationChannelType {
+  slack
+  email
+  webhook
+}
+
+enum NotificationDeliveryStatus {
+  pending
+  sent
+  failed
+}
+
+model NotificationChannel {
+  id       String                  @id @default(cuid())
+  tenantId String
+  type     NotificationChannelType
+  name     String?
+  enabled  Boolean                 @default(true)
+
+  /// Channel-specific config:
+  /// - slack:   { webhookUrl: string }
+  /// - email:   { to: string, from?: string }
+  /// - webhook: { url: string, secret?: string }
+  config Json
+
+  /// Optional per-channel filters:
+  /// { minRisk?: number, verdicts?: ("warn"|"block")[], eventTypes?: ("NAVIGATE"|"DOWNLOAD")[] }
+  filters Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant     Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries NotificationDelivery[]
+
+  @@index([tenantId])
+}
+
+model NotificationDelivery {
+  id           String                     @id @default(cuid())
+  tenantId     String
+  channelId    String
+  kind         String // e.g. "incident_created"
+  status       NotificationDeliveryStatus @default(pending)
+  attemptCount Int                        @default(0)
+  lastError    String?
+  payload      Json
+  createdAt    DateTime                   @default(now())
+  sentAt       DateTime?
+
+  tenant  Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel NotificationChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([channelId, createdAt])
+}

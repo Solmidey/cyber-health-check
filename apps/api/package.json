@@ -1,0 +1,29 @@
+{
+  "name": "@chc/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm exec tsx watch src/server.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/rate-limit": "^10.3.0",
+    "@prisma/adapter-pg": "^7.3.0",
+    "@prisma/client": "^7.3.0",
+    "dotenv": "^16.0.0",
+    "fastify": "^5.7.4",
+    "pg": "^8.18.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.33",
+    "@types/pg": "^8.16.0",
+    "eslint": "^9.0.0",
+    "prisma": "^7.3.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
