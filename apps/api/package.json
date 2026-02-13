@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "pnpm exec tsx watch src/server.ts"
+    "dev": "pnpm exec tsx watch src/server.ts",
+    "worker": "pnpm exec tsx watch src/worker.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.2.0",

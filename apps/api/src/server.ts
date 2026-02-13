@@ -6,7 +6,7 @@ import { z } from "zod";
 import "dotenv/config";
 import crypto from "node:crypto";
 import { db } from "./db.js";
-import { notifyIncidentCreated } from "./notifications.js"; // NodeNext requires explicit extension
+import { notifyIncidentCreated, validateChannelConfig } from "./notifications.js"; // NodeNext requires explicit extension
 
 /**
  * =========================
@@ -18,11 +18,9 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
-  // Commandment: secret management (never log; rotate in prod)
   TENANT_TOKEN_SECRET: z.string().min(20),
   DEVICE_TOKEN_SECRET: z.string().min(20),
 
-  // Commandment: strict CORS (lock down origins)
   DASHBOARD_ORIGIN: z.string().url(),
   EXTENSION_ORIGIN: z.string().optional()
 });
@@ -73,7 +71,6 @@ function verifyHmacToken<T>(token: string, secret: string): T | null {
   if (!payloadB64 || !sigB64) return null;
 
   const payloadJson = Buffer.from(payloadB64, "base64url").toString("utf8");
-
   const expectedSig = crypto.createHmac("sha256", secret).update(payloadJson).digest("base64url");
   if (!timingSafeEqual(expectedSig, sigB64)) return null;
 
@@ -105,7 +102,6 @@ function requireAuth(req: FastifyRequest, reply: FastifyReply): AuthContext | nu
  * =========================
  * Zod schemas
  * =========================
- * Commandment: validation & sanitization at boundary
  */
 const reputationCheckBody = z.object({
   url: z.string().url(),
@@ -180,62 +176,94 @@ const deliveriesQuery = z.object({
   channelId: z.string().optional()
 });
 
-/**
- * Commandment: secret management — never return webhook URL / secrets to clients.
- */
+const ruleSchema = z.object({
+  name: z.string().min(1),
+  enabled: z.boolean().optional(),
+  mode: z.enum(["immediate", "digest"]).optional(),
+
+  minRisk: z.number().int().min(0).max(100).optional(),
+  verdicts: z.array(z.enum(["warn", "block"])).optional(),
+  eventTypes: z.array(z.enum(["NAVIGATE", "DOWNLOAD"])).optional(),
+
+  hostAllow: z.array(z.string().min(1)).optional(),
+  hostDeny: z.array(z.string().min(1)).optional(),
+
+  channelIds: z.array(z.string().min(1)).min(1)
+});
+
+const rulePatchSchema = ruleSchema.partial().extend({
+  channelIds: z.array(z.string().min(1)).min(1).optional()
+});
+
 function redactChannelForResponse(channel: any) {
   const cfg = channel.config ?? {};
   const redactedConfig: Record<string, unknown> = { ...cfg };
 
-  if (channel.type === "slack" && typeof cfg.webhookUrl === "string") {
-    redactedConfig.webhookUrl = "redacted";
-  }
-  if (channel.type === "webhook" && typeof cfg.secret === "string") {
-    redactedConfig.secret = "redacted";
-  }
+  if (channel.type === "slack" && typeof cfg.webhookUrl === "string") redactedConfig.webhookUrl = "redacted";
+  if (channel.type === "webhook" && typeof cfg.secret === "string") redactedConfig.secret = "redacted";
 
   return { ...channel, config: redactedConfig };
+}
+
+async function bootstrapDefaultRulesIfNeeded(tenantId: string, channelId: string) {
+  /**
+   * If tenant has zero rules, bootstrap sensible defaults (top-tier onboarding).
+   * Easy removal: delete this function + call site.
+   */
+  const existingRules = await db.notificationRule.count({ where: { tenantId } });
+  if (existingRules > 0) return;
+
+  await db.notificationRule.create({
+    data: {
+      tenantId,
+      name: "Block → Alerts",
+      enabled: true,
+      mode: "immediate",
+      minRisk: 90,
+      verdicts: ["block"],
+      eventTypes: [],
+      hostAllow: [],
+      hostDeny: [],
+      channels: { create: [{ channelId }] }
+    }
+  });
+
+  await db.notificationRule.create({
+    data: {
+      tenantId,
+      name: "Warn → Alerts (High Risk)",
+      enabled: true,
+      mode: "immediate",
+      minRisk: 70,
+      verdicts: ["warn"],
+      eventTypes: [],
+      hostAllow: [],
+      hostDeny: [],
+      channels: { create: [{ channelId }] }
+    }
+  });
 }
 
 function createApp() {
   const app = Fastify({
     logger: {
       level: env.NODE_ENV === "production" ? "info" : "debug",
-      // Commandment: safe logging (never log secrets/tokens)
-      redact: [
-        "req.headers.authorization",
-        "req.headers['x-tenant-token']",
-        "req.headers['x-device-token']"
-      ]
+      redact: ["req.headers.authorization", "req.headers['x-tenant-token']", "req.headers['x-device-token']"]
     }
   });
 
-  /**
-   * =========================
-   * Security + platform basics
-   * =========================
-   */
   app.register(helmet);
 
   app.register(cors, {
     origin: (origin, cb) => {
-      // Allow non-browser tools like curl (no Origin header).
       if (!origin) return cb(null, true);
-
       const allowed = new Set<string>([env.DASHBOARD_ORIGIN]);
       if (env.EXTENSION_ORIGIN) allowed.add(env.EXTENSION_ORIGIN);
-
       cb(null, allowed.has(origin));
     },
     credentials: false
   });
 
-  /**
-   * =========================
-   * Rate limiting
-   * =========================
-   * Commandment: rate limiting and abuse protection.
-   */
   app.register(rateLimit, {
     global: true,
     max: 120,
@@ -243,19 +271,8 @@ function createApp() {
     keyGenerator: (req) => `${req.ip}`
   });
 
-  /**
-   * =========================
-   * Health (no auth)
-   * =========================
-   */
   app.get("/health", async () => ({ ok: true }));
 
-  /**
-   * =========================
-   * Auth preHandler for /v1/*
-   * =========================
-   * Commandment: strict authorization
-   */
   app.addHook("preHandler", async (req, reply) => {
     if (!req.url.startsWith("/v1/")) return;
 
@@ -269,24 +286,14 @@ function createApp() {
     const tenant = verifyHmacToken<TenantAuth>(tenantToken, env.TENANT_TOKEN_SECRET);
     const device = verifyHmacToken<DeviceAuth>(deviceToken, env.DEVICE_TOKEN_SECRET);
 
-    if (!tenant || !device) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
+    if (!tenant || !device) return reply.code(401).send({ error: "unauthorized" });
 
     req.auth = { tenant, device };
   });
 
-  /**
-   * =========================
-   * POST /v1/reputation/check
-   * =========================
-   * Returns: { risk, verdict, reasons, checked }
-   */
   app.post("/v1/reputation/check", async (req, reply) => {
     const parsed = reputationCheckBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
 
     const { url, eventType } = parsed.data;
 
@@ -301,14 +308,7 @@ function createApp() {
     const reasons: string[] = [];
     let risk = 0;
 
-    /**
-     * ============================================================
-     * DEV-ONLY START: deterministic WARN/BLOCK triggers
-     * ============================================================
-     * ?chc-test=warn  -> risk >= 70
-     * ?chc-test=block -> risk >= 95
-     * Disabled automatically in production.
-     */
+    // DEV-ONLY deterministic triggers
     if (env.NODE_ENV !== "production") {
       const t = u.searchParams.get("chc-test");
       if (t === "warn") {
@@ -319,15 +319,12 @@ function createApp() {
         reasons.push("dev_test_block");
       }
     }
-    /** DEV-ONLY END */
 
-    // Heuristic: punycode domains often used in phishing
     if (hostname.startsWith("xn--")) {
       risk = Math.max(risk, 75);
       reasons.push("punycode_domain");
     }
 
-    // Heuristic: small set of higher-risk TLDs (conservative)
     const suspiciousTlds = new Set(["zip", "mov"]);
     const tld = hostname.split(".").pop() ?? "";
     if (suspiciousTlds.has(tld)) {
@@ -335,20 +332,13 @@ function createApp() {
       reasons.push("suspicious_tld");
     }
 
-    // Downloads get a baseline bump (event context matters)
     if (eventType === "DOWNLOAD") {
       risk = Math.max(risk, 50);
       reasons.push("download_event");
     }
 
     const verdict: Verdict = risk >= 90 ? "block" : risk >= 60 ? "warn" : "allow";
-
-    return reply.send({
-      risk,
-      verdict,
-      reasons,
-      checked: { hostname, url }
-    });
+    return reply.send({ risk, verdict, reasons, checked: { hostname, url } });
   });
 
   /**
@@ -373,18 +363,20 @@ function createApp() {
     if (!auth) return;
 
     const parsed = channelUpsertBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
 
     const body = parsed.data;
     const tenantId = auth.tenant.tenantId;
     const enabled = body.enabled ?? true;
 
+    // ✅ FAIL-FAST validation (top-tier UX + ops)
+    const validation = await validateChannelConfig(body.type, body.config);
+    if (!validation.ok) {
+      return reply.code(400).send({ error: "bad_request", message: validation.error });
+    }
+
     if (body.id) {
-      const existing = await db.notificationChannel.findFirst({
-        where: { id: body.id, tenantId }
-      });
+      const existing = await db.notificationChannel.findFirst({ where: { id: body.id, tenantId } });
       if (!existing) return reply.code(404).send({ error: "not_found" });
 
       const channel = await db.notificationChannel.update({
@@ -394,7 +386,6 @@ function createApp() {
           name: body.name ?? null,
           type: body.type,
           config: body.config,
-          // Commandment: DB hygiene — omit JSON field instead of storing null
           filters: body.filters ?? undefined
         }
       });
@@ -413,6 +404,13 @@ function createApp() {
       }
     });
 
+    // Bootstrap defaults (safe)
+    try {
+      await bootstrapDefaultRulesIfNeeded(tenantId, channel.id);
+    } catch (err) {
+      req.log.warn({ err }, "bootstrap_rules_failed");
+    }
+
     return reply.send({ channel: redactChannelForResponse(channel) });
   });
 
@@ -423,10 +421,7 @@ function createApp() {
     const tenantId = auth.tenant.tenantId;
     const id = (req.params as any).id as string;
 
-    const existing = await db.notificationChannel.findFirst({
-      where: { id, tenantId }
-    });
-
+    const existing = await db.notificationChannel.findFirst({ where: { id, tenantId } });
     if (!existing) return reply.code(404).send({ error: "not_found" });
 
     await db.notificationChannel.delete({ where: { id } });
@@ -435,28 +430,188 @@ function createApp() {
 
   /**
    * =========================
-   * Notifications: Status (ops)
+   * Notifications: Rules CRUD
    * =========================
    */
+  app.get("/v1/notifications/rules", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const rules = await db.notificationRule.findMany({
+      where: { tenantId: auth.tenant.tenantId },
+      orderBy: { createdAt: "desc" },
+      include: { channels: true }
+    });
+
+    return reply.send({
+      rules: rules.map((r) => ({
+        id: r.id,
+        tenantId: r.tenantId,
+        name: r.name,
+        enabled: r.enabled,
+        mode: r.mode,
+        minRisk: r.minRisk,
+        verdicts: r.verdicts,
+        eventTypes: r.eventTypes,
+        hostAllow: r.hostAllow,
+        hostDeny: r.hostDeny,
+        channelIds: r.channels.map((rc) => rc.channelId),
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt
+      }))
+    });
+  });
+
+  app.post("/v1/notifications/rules", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const parsed = ruleSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+    const tenantId = auth.tenant.tenantId;
+    const body = parsed.data;
+
+    const channels = await db.notificationChannel.findMany({
+      where: { tenantId, id: { in: body.channelIds } },
+      select: { id: true }
+    });
+    if (channels.length !== body.channelIds.length) {
+      return reply.code(400).send({ error: "bad_request", message: "invalid_channelIds" });
+    }
+
+    const rule = await db.notificationRule.create({
+      data: {
+        tenantId,
+        name: body.name,
+        enabled: body.enabled ?? true,
+        mode: body.mode ?? "immediate",
+        minRisk: body.minRisk ?? null,
+        verdicts: body.verdicts ?? [],
+        eventTypes: body.eventTypes ?? [],
+        hostAllow: body.hostAllow ?? [],
+        hostDeny: body.hostDeny ?? [],
+        channels: { create: body.channelIds.map((channelId) => ({ channelId })) }
+      },
+      include: { channels: true }
+    });
+
+    return reply.send({
+      rule: {
+        id: rule.id,
+        name: rule.name,
+        enabled: rule.enabled,
+        mode: rule.mode,
+        minRisk: rule.minRisk,
+        verdicts: rule.verdicts,
+        eventTypes: rule.eventTypes,
+        hostAllow: rule.hostAllow,
+        hostDeny: rule.hostDeny,
+        channelIds: rule.channels.map((rc) => rc.channelId),
+        createdAt: rule.createdAt,
+        updatedAt: rule.updatedAt
+      }
+    });
+  });
+
+  app.patch("/v1/notifications/rules/:id", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const tenantId = auth.tenant.tenantId;
+    const id = (req.params as any).id as string;
+
+    const parsed = rulePatchSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+    const existing = await db.notificationRule.findFirst({ where: { id, tenantId } });
+    if (!existing) return reply.code(404).send({ error: "not_found" });
+
+    if (parsed.data.channelIds) {
+      const channels = await db.notificationChannel.findMany({
+        where: { tenantId, id: { in: parsed.data.channelIds } },
+        select: { id: true }
+      });
+      if (channels.length !== parsed.data.channelIds.length) {
+        return reply.code(400).send({ error: "bad_request", message: "invalid_channelIds" });
+      }
+    }
+
+    const updated = await db.$transaction(async (tx: TxClient) => {
+      if (parsed.data.channelIds) {
+        await tx.notificationRuleChannel.deleteMany({ where: { ruleId: id } });
+        await tx.notificationRuleChannel.createMany({
+          data: parsed.data.channelIds.map((channelId) => ({ ruleId: id, channelId }))
+        });
+      }
+
+      return tx.notificationRule.update({
+        where: { id },
+        data: {
+          name: parsed.data.name ?? undefined,
+          enabled: parsed.data.enabled ?? undefined,
+          mode: parsed.data.mode ?? undefined,
+          minRisk: parsed.data.minRisk ?? undefined,
+          verdicts: parsed.data.verdicts ?? undefined,
+          eventTypes: parsed.data.eventTypes ?? undefined,
+          hostAllow: parsed.data.hostAllow ?? undefined,
+          hostDeny: parsed.data.hostDeny ?? undefined
+        },
+        include: { channels: true }
+      });
+    });
+
+    return reply.send({
+      rule: {
+        id: updated.id,
+        name: updated.name,
+        enabled: updated.enabled,
+        mode: updated.mode,
+        minRisk: updated.minRisk,
+        verdicts: updated.verdicts,
+        eventTypes: updated.eventTypes,
+        hostAllow: updated.hostAllow,
+        hostDeny: updated.hostDeny,
+        channelIds: updated.channels.map((rc) => rc.channelId),
+        createdAt: updated.createdAt,
+        updatedAt: updated.updatedAt
+      }
+    });
+  });
+
+  app.delete("/v1/notifications/rules/:id", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const tenantId = auth.tenant.tenantId;
+    const id = (req.params as any).id as string;
+
+    const existing = await db.notificationRule.findFirst({ where: { id, tenantId } });
+    if (!existing) return reply.code(404).send({ error: "not_found" });
+
+    await db.notificationRule.delete({ where: { id } });
+    return reply.send({ ok: true });
+  });
+
   app.get("/v1/notifications/status", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const tenantId = auth.tenant.tenantId;
 
-    const [channelsTotal, channelsEnabled, lastDelivery] = await Promise.all([
+    const [channelsTotal, channelsEnabled, rulesTotal, rulesEnabled, lastDelivery] = await Promise.all([
       db.notificationChannel.count({ where: { tenantId } }),
       db.notificationChannel.count({ where: { tenantId, enabled: true } }),
-      db.notificationDelivery.findFirst({
-        where: { tenantId },
-        orderBy: { createdAt: "desc" }
-      })
+      db.notificationRule.count({ where: { tenantId } }),
+      db.notificationRule.count({ where: { tenantId, enabled: true } }),
+      db.notificationDelivery.findFirst({ where: { tenantId }, orderBy: { createdAt: "desc" } })
     ]);
 
     return reply.send({
       alertsEnabled: process.env.ALERTS_ENABLED === "true",
       tenantId,
       channels: { total: channelsTotal, enabled: channelsEnabled },
+      rules: { total: rulesTotal, enabled: rulesEnabled },
       lastDelivery: lastDelivery
         ? {
             id: lastDelivery.id,
@@ -469,37 +624,25 @@ function createApp() {
     });
   });
 
-  /**
-   * =========================
-   * Notifications: Deliveries (debug)
-   * =========================
-   */
   app.get("/v1/notifications/deliveries", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const parsed = deliveriesQuery.safeParse(req.query);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
 
     const { limit, cursor, status, channelId } = parsed.data;
     const tenantId = auth.tenant.tenantId;
 
-    const where: any = { tenantId };
-    if (status) where.status = status;
-    if (channelId) where.channelId = channelId;
+    const where: Record<string, unknown> = { tenantId };
+    if (status) (where as any).status = status;
+    if (channelId) (where as any).channelId = channelId;
 
     const deliveries = await db.notificationDelivery.findMany({
-      where,
+      where: where as any,
       orderBy: { createdAt: "desc" },
       take: limit + 1,
-      ...(cursor
-        ? {
-            cursor: { id: cursor },
-            skip: 1
-          }
-        : {})
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
     });
 
     const hasMore = deliveries.length > limit;
@@ -521,27 +664,18 @@ function createApp() {
     });
   });
 
-  /**
-   * =========================
-   * Notifications: Test
-   * =========================
-   * Sends a test incident notification ONLY to the provided channelId.
-   */
   app.post("/v1/notifications/test", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const parsed = testChannelBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
 
     const tenantId = auth.tenant.tenantId;
 
     const channel = await db.notificationChannel.findFirst({
       where: { id: parsed.data.channelId, tenantId }
     });
-
     if (!channel) return reply.code(404).send({ error: "not_found" });
 
     try {
@@ -555,7 +689,7 @@ function createApp() {
           firstSeenAt: new Date(),
           eventType: "DOWNLOAD"
         },
-        { onlyChannelId: channel.id }
+        { onlyChannelId: channel.id, reason: "test" }
       );
     } catch (err) {
       req.log.warn({ err }, "notification_test_failed");
@@ -565,28 +699,16 @@ function createApp() {
     return reply.send({ ok: true });
   });
 
-  /**
-   * =========================
-   * POST /v1/events
-   * =========================
-   * Commandment: server-side logic (do not trust client scoring)
-   * - Score via internal route
-   * - Persist event + aggregate incidents
-   * - Notify only on NEW incident creation
-   */
   app.post("/v1/events", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const parsed = eventBody.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
 
     const { type, url, ts } = parsed.data;
     const { tenant, device } = auth;
 
-    // Score using internal route (single source of truth)
     const injected = await app.inject({
       method: "POST",
       url: "/v1/reputation/check",
@@ -610,11 +732,6 @@ function createApp() {
     const reasons = scored.reasons;
     const hostname = scored.checked.hostname.toLowerCase();
 
-    /**
-     * Commandments:
-     * - Strict authorization: tenant/user/device IDs from verified tokens only.
-     * - Server-side logic: persist server-scored verdict/risk, not client claims.
-     */
     await db.tenant.upsert({
       where: { id: tenant.tenantId },
       update: { plan: tenant.plan },
@@ -648,7 +765,6 @@ function createApp() {
       }
     });
 
-    // If warn/block, aggregate incident and (if new) notify.
     let createdIncidentPayload:
       | {
           tenantId: string;
@@ -692,10 +808,7 @@ function createApp() {
           return { created };
         }
 
-        const mergedReasons = Array.from(new Set([...(existing.reasons || []), ...reasons])).slice(
-          0,
-          20
-        );
+        const mergedReasons = Array.from(new Set([...(existing.reasons || []), ...reasons])).slice(0, 20);
 
         await tx.incident.update({
           where: {
@@ -729,7 +842,6 @@ function createApp() {
       }
     }
 
-    // Notify only for NEW incidents, never block ingestion if notify fails.
     if (createdIncidentPayload) {
       try {
         await notifyIncidentCreated(createdIncidentPayload);
@@ -749,11 +861,6 @@ function createApp() {
     });
   });
 
-  /**
-   * =========================
-   * GET /v1/incidents
-   * =========================
-   */
   app.get("/v1/incidents", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
@@ -767,11 +874,6 @@ function createApp() {
     return reply.send({ incidents });
   });
 
-  /**
-   * =========================
-   * GET /v1/events/recent
-   * =========================
-   */
   app.get("/v1/events/recent", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
@@ -785,12 +887,6 @@ function createApp() {
     return reply.send({ events });
   });
 
-  /**
-   * =========================
-   * Central error handler
-   * =========================
-   * Commandment: careful error handling (no stack leaks).
-   */
   app.setErrorHandler((err, req, reply) => {
     req.log.error({ err, url: safeUrlForLog(req.url) }, "request_error");
     reply.code(500).send({ error: "internal_error" });

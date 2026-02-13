@@ -7,15 +7,19 @@ datasource db {
 }
 
 model Tenant {
-  id                     String                 @id
-  plan                   String
-  createdAt              DateTime               @default(now())
-  users                  User[]
-  devices                Device[]
-  events                 Event[]
-  incidents              Incident[]
-  notificationChannels   NotificationChannel[]
-  notificationDeliveries NotificationDelivery[]
+  id        String   @id
+  plan      String
+  createdAt DateTime @default(now())
+
+  users     User[]
+  devices   Device[]
+  events    Event[]
+  incidents Incident[]
+
+  notificationChannels     NotificationChannel[]
+  notificationDeliveries   NotificationDelivery[]
+  notificationRules        NotificationRule[]
+  notificationSuppressions NotificationSuppression[]
 }
 
 model User {
@@ -25,9 +29,7 @@ model User {
 
   tenant  Tenant   @relation(fields: [tenantId], references: [id])
   devices Device[]
-
-  // ✅ Add this line (inverse relation for Event.user)
-  events Event[]
+  events  Event[]
 }
 
 model Device {
@@ -35,9 +37,10 @@ model Device {
   tenantId  String
   userId    String
   createdAt DateTime @default(now())
-  tenant    Tenant   @relation(fields: [tenantId], references: [id])
-  user      User     @relation(fields: [userId], references: [id])
-  events    Event[]
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id])
+  user   User    @relation(fields: [userId], references: [id])
+  events Event[]
 }
 
 model Event {
@@ -92,6 +95,7 @@ enum NotificationDeliveryStatus {
   pending
   sent
   failed
+  skipped
 }
 
 model NotificationChannel {
@@ -101,14 +105,14 @@ model NotificationChannel {
   name     String?
   enabled  Boolean                 @default(true)
 
-  /// Channel-specific config:
-  /// - slack:   { webhookUrl: string }
-  /// - email:   { to: string, from?: string }
-  /// - webhook: { url: string, secret?: string }
+  // channel-specific config:
+  // slack:   { webhookUrl: string }
+  // email:   { to: string, from?: string }
+  // webhook: { url: string, secret?: string }
   config Json
 
-  /// Optional per-channel filters:
-  /// { minRisk?: number, verdicts?: ("warn"|"block")[], eventTypes?: ("NAVIGATE"|"DOWNLOAD")[] }
+  // optional filters:
+  // { minRisk?: number, verdicts?: ("warn"|"block")[], eventTypes?: ("NAVIGATE"|"DOWNLOAD")[] }
   filters Json?
 
   createdAt DateTime @default(now())
@@ -117,6 +121,9 @@ model NotificationChannel {
   tenant     Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   deliveries NotificationDelivery[]
 
+  // inverse relation for NotificationRuleChannel.channel
+  ruleLinks NotificationRuleChannel[]
+
   @@index([tenantId])
 }
 
@@ -124,7 +131,7 @@ model NotificationDelivery {
   id           String                     @id @default(cuid())
   tenantId     String
   channelId    String
-  kind         String // e.g. "incident_created"
+  kind         String // "incident_created" | "incident_digest" | etc.
   status       NotificationDeliveryStatus @default(pending)
   attemptCount Int                        @default(0)
   lastError    String?
@@ -132,9 +139,78 @@ model NotificationDelivery {
   createdAt    DateTime                   @default(now())
   sentAt       DateTime?
 
+  // ✅ retry scheduling
+  nextAttemptAt DateTime?
+  lastAttemptAt DateTime?
+
   tenant  Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   channel NotificationChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
 
   @@index([tenantId, createdAt])
   @@index([channelId, createdAt])
+  @@index([status, nextAttemptAt])
+}
+
+enum NotificationMode {
+  immediate
+  digest
+}
+
+model NotificationRule {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name    String
+  enabled Boolean          @default(true)
+  mode    NotificationMode @default(immediate)
+
+  // Conditions (optional; if empty => matches)
+  minRisk    Int?
+  verdicts   String[] // ["warn","block"]
+  eventTypes String[] // ["NAVIGATE","DOWNLOAD"]
+
+  // Host routing controls
+  hostAllow String[] // if non-empty, only these hosts match
+  hostDeny  String[] // if contains host, rule won't match
+
+  channels NotificationRuleChannel[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, enabled])
+  @@index([tenantId, createdAt])
+}
+
+model NotificationRuleChannel {
+  ruleId    String
+  channelId String
+
+  rule    NotificationRule    @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  channel NotificationChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@id([ruleId, channelId])
+  @@index([channelId])
+}
+
+/**
+ * Mute/suppression (top-tier UX):
+ * - prevents alert fatigue for noisy hosts
+ * - engine writes `skipped` deliveries for audit
+ */
+model NotificationSuppression {
+  id         String   @id @default(cuid())
+  tenantId   String
+  hostname   String
+  mutedUntil DateTime
+  reason     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, hostname])
+  @@index([tenantId, mutedUntil])
 }
