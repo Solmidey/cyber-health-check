@@ -1,6 +1,5 @@
 import "dotenv/config";
 import crypto from "node:crypto";
-import type { Prisma } from "@prisma/client";
 import { db } from "./db.js";
 
 /**
@@ -31,7 +30,13 @@ export type IncidentCreatedPayload = {
   eventType: "NAVIGATE" | "DOWNLOAD";
 };
 
-type DigestTopHost = { hostname: string; verdict: "warn" | "block"; maxRisk: number; count: number };
+type IncidentVerdict = "warn" | "block";
+type ChannelType = "slack" | "webhook" | "email";
+
+/** ✅ Fix #1: define DeliveryStatus (your TS error) */
+type DeliveryStatus = "pending" | "sent" | "failed" | "skipped";
+
+type DigestHost = { hostname: string; verdict: IncidentVerdict; maxRisk: number; count: number };
 
 type DigestPayload = {
   tenantId: string;
@@ -40,38 +45,36 @@ type DigestPayload = {
   summary: {
     blocks: number;
     warns: number;
-    topHosts: DigestTopHost[];
+    topHosts: DigestHost[];
   };
 };
 
 type NotifyOptions = { onlyChannelId?: string };
 
-/**
- * ============================================================
- * Flags
- * ============================================================
- */
+type SlackBlock =
+  | { type: "header"; text: { type: "plain_text"; text: string } }
+  | {
+      type: "section";
+      text?: { type: "mrkdwn"; text: string };
+      fields?: Array<{ type: "mrkdwn"; text: string }>;
+    };
+
 function alertsEnabled(): boolean {
-  // keep compatibility with older env var name
   return process.env.ALERTS_ENABLED === "true" || process.env.NOTIFICATIONS_ENABLED === "true";
 }
 
 /**
- * ============================================================
- * Backoff + failure classification
- * ============================================================
+ * attemptCount starts at 1
+ * (No array indexing => no "number | undefined" problems)
  */
-function computeBackoffMs(attemptCountRaw: number | null | undefined): number {
-  // Normalize: attemptCount starts at 1, but DB may have 0/null
-  const attemptCount = typeof attemptCountRaw === "number" && Number.isFinite(attemptCountRaw) ? attemptCountRaw : 1;
-
-  const base = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000]; // 1m, 5m, 30m, 2h
-  const idx = Math.min(Math.max(attemptCount - 1, 0), base.length - 1);
-  return base[idx] ?? 60_000;
+function computeBackoffMs(attemptCount: number): number {
+  if (attemptCount <= 1) return 60_000;
+  if (attemptCount === 2) return 5 * 60_000;
+  if (attemptCount === 3) return 30 * 60_000;
+  return 2 * 60 * 60_000;
 }
 
 function isPermanentFailure(status: number, body: string): boolean {
-  // Slack webhook errors + typical "never retry" HTTP statuses
   if (status === 403 && body.includes("invalid_token")) return true;
   if (status === 401) return true;
   if (status === 404) return true;
@@ -83,16 +86,7 @@ function isTransientFailure(status: number): boolean {
   return status === 429 || status >= 500;
 }
 
-/**
- * ============================================================
- * Small helpers
- * ============================================================
- */
-function truncate(s: string, n: number) {
-  return s.length > n ? `${s.slice(0, n)}…` : s;
-}
-
-async function postJson(url: string, body: any, headers?: Record<string, string>) {
+async function postJson(url: string, body: unknown, headers?: Record<string, string>) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...(headers ?? {}) },
@@ -102,54 +96,26 @@ async function postJson(url: string, body: any, headers?: Record<string, string>
   return { ok: res.ok, status: res.status, text };
 }
 
-function signWebhook(secret: string, payload: any): string {
+function signWebhook(secret: string, payload: unknown): string {
   const raw = JSON.stringify(payload);
   return crypto.createHmac("sha256", secret).update(raw).digest("hex");
 }
 
-/**
- * ============================================================
- * JsonValue guards for Prisma Json fields (config/filters/payload)
- * ============================================================
- */
-type JsonObject = { [k: string]: Prisma.JsonValue };
-
-function isJsonObject(v: Prisma.JsonValue): v is JsonObject {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
 }
 
-function getSlackWebhookUrl(config: Prisma.JsonValue): string | null {
-  if (!isJsonObject(config)) return null;
-  const w = config["webhookUrl"];
-  return typeof w === "string" ? w : null;
+function getString(obj: Record<string, unknown> | null, key: string): string | null {
+  if (!obj) return null;
+  const v = obj[key];
+  return typeof v === "string" ? v : null;
 }
-
-function getWebhookConfig(config: Prisma.JsonValue): { url: string; secret?: string } | null {
-  if (!isJsonObject(config)) return null;
-  const url = config["url"];
-  if (typeof url !== "string") return null;
-  const secretVal = config["secret"];
-  const secret = typeof secretVal === "string" ? secretVal : undefined;
-  return { url, secret };
-}
-
-/**
- * ============================================================
- * Verdict guards (Prisma Incident.verdict is String => TS sees string)
- * ============================================================
- */
-type IncidentVerdict = "warn" | "block";
 
 function asIncidentVerdict(v: unknown): IncidentVerdict | null {
   return v === "warn" || v === "block" ? v : null;
 }
 
-/**
- * ============================================================
- * Slack message builders
- * ============================================================
- */
-function buildSlackMessageIncident(payload: IncidentCreatedPayload) {
+function buildSlackMessageIncident(payload: IncidentCreatedPayload): { text: string; blocks: SlackBlock[] } {
   const title = payload.verdict === "block" ? "🚫 Blocked" : "⚠️ Warned";
   const when = payload.firstSeenAt.toISOString();
 
@@ -177,11 +143,11 @@ function buildSlackMessageIncident(payload: IncidentCreatedPayload) {
   };
 }
 
-function buildSlackMessageDigest(p: DigestPayload) {
+function buildSlackMessageDigest(p: DigestPayload): { text: string; blocks: SlackBlock[] } {
   const ws = p.windowStart.toISOString();
   const we = p.windowEnd.toISOString();
 
-  const lines = [
+  const lines: string[] = [
     `*Window:* ${ws} → ${we}`,
     `*Blocked:* ${p.summary.blocks}`,
     `*Warned:* ${p.summary.warns}`,
@@ -203,19 +169,14 @@ function buildSlackMessageDigest(p: DigestPayload) {
   };
 }
 
-/**
- * ============================================================
- * Filters + rule matching
- * ============================================================
- */
 function channelAllows(
-  channel: { filters: Prisma.JsonValue | null; enabled: boolean },
+  channel: { filters: unknown; enabled: boolean },
   ctx: { maxRisk: number; verdict: IncidentVerdict; eventType: "NAVIGATE" | "DOWNLOAD" }
 ): boolean {
   if (!channel.enabled) return false;
 
-  const f = channel.filters;
-  if (!f || !isJsonObject(f)) return true;
+  const f = asRecord(channel.filters);
+  if (!f) return true;
 
   const minRisk = f["minRisk"];
   if (typeof minRisk === "number" && ctx.maxRisk < minRisk) return false;
@@ -250,13 +211,7 @@ function ruleMatches(
   return true;
 }
 
-/**
- * ============================================================
- * Suppression
- * ============================================================
- */
 async function getActiveSuppression(tenantId: string, hostname: string) {
-  // NOTE: requires NotificationSuppression model in schema
   const row = await db.notificationSuppression.findFirst({
     where: { tenantId, hostname: hostname.toLowerCase(), mutedUntil: { gt: new Date() } },
     select: { mutedUntil: true, reason: true }
@@ -264,19 +219,14 @@ async function getActiveSuppression(tenantId: string, hostname: string) {
   return row ? { mutedUntil: row.mutedUntil, reason: row.reason ?? null } : null;
 }
 
-/**
- * ============================================================
- * Delivery helpers
- * ============================================================
- */
 async function recordDelivery(args: {
   tenantId: string;
   channelId: string;
   kind: string;
-  status: "pending" | "sent" | "failed" | "skipped";
+  status: DeliveryStatus;
   attemptCount: number;
   lastError: string | null;
-  payload: any;
+  payload: unknown;
   sentAt: Date | null;
   nextAttemptAt: Date | null;
   lastAttemptAt: Date | null;
@@ -286,14 +236,14 @@ async function recordDelivery(args: {
       tenantId: args.tenantId,
       channelId: args.channelId,
       kind: args.kind,
-      status: args.status,
+      status: args.status as any,
       attemptCount: args.attemptCount,
       lastError: args.lastError,
-      payload: args.payload,
+      payload: args.payload as any,
       sentAt: args.sentAt,
       nextAttemptAt: args.nextAttemptAt,
       lastAttemptAt: args.lastAttemptAt
-    } as any
+    }
   });
 }
 
@@ -302,20 +252,15 @@ async function updateDelivery(id: string, data: Record<string, unknown>) {
 }
 
 async function maybeAutoDisableChannel(channelId: string, reason: string) {
-  // Auto-disable after repeated failures in 24h — prevents noisy loops
   const failures = await db.notificationDelivery.count({
-    where: { channelId, status: "failed", createdAt: { gt: new Date(Date.now() - 24 * 60 * 60_000) } }
+    where: { channelId, status: "failed" as any, createdAt: { gt: new Date(Date.now() - 24 * 60 * 60_000) } }
   });
 
   if (failures < 5) return;
 
   await db.notificationChannel.update({ where: { id: channelId }, data: { enabled: false } });
 
-  // Leave an audit trail (no secrets)
-  const ch = await db.notificationChannel.findUnique({
-    where: { id: channelId },
-    select: { tenantId: true }
-  });
+  const ch = await db.notificationChannel.findUnique({ where: { id: channelId }, select: { tenantId: true } });
   if (!ch) return;
 
   await db.notificationDelivery.create({
@@ -323,12 +268,14 @@ async function maybeAutoDisableChannel(channelId: string, reason: string) {
       tenantId: ch.tenantId,
       channelId,
       kind: "channel_disabled",
-      status: "sent",
+      status: "sent" as any,
       attemptCount: 0,
       lastError: reason.slice(0, 300),
-      payload: { reason },
-      sentAt: new Date()
-    } as any
+      payload: { reason } as any,
+      sentAt: new Date(),
+      nextAttemptAt: null,
+      lastAttemptAt: new Date()
+    }
   });
 }
 
@@ -344,14 +291,8 @@ export async function notifyIncidentCreated(payload: IncidentCreatedPayload, opt
   const hostname = payload.hostname.toLowerCase();
 
   const [rules, channels] = await Promise.all([
-    db.notificationRule.findMany({
-      where: { tenantId, enabled: true },
-      include: { channels: true }
-    }),
-    db.notificationChannel.findMany({
-      where: { tenantId, enabled: true },
-      orderBy: { createdAt: "desc" }
-    })
+    db.notificationRule.findMany({ where: { tenantId, enabled: true }, include: { channels: true } }),
+    db.notificationChannel.findMany({ where: { tenantId, enabled: true }, orderBy: { createdAt: "desc" } })
   ]);
 
   const channelMap = new Map(channels.map((c) => [c.id, c]));
@@ -360,17 +301,8 @@ export async function notifyIncidentCreated(payload: IncidentCreatedPayload, opt
   const matchedChannelIds = new Set<string>();
   for (const rule of rules) {
     if (rule.mode !== "immediate") continue;
-
-    if (
-      !ruleMatches(rule, {
-        hostname,
-        maxRisk: payload.maxRisk,
-        verdict: payload.verdict,
-        eventType: payload.eventType
-      })
-    ) {
+    if (!ruleMatches(rule, { hostname, maxRisk: payload.maxRisk, verdict: payload.verdict, eventType: payload.eventType }))
       continue;
-    }
 
     for (const link of rule.channels ?? []) {
       if (only && !only.has(link.channelId)) continue;
@@ -380,17 +312,13 @@ export async function notifyIncidentCreated(payload: IncidentCreatedPayload, opt
 
   if (matchedChannelIds.size === 0) return;
 
-  const targets: any[] = [];
-  for (const id of matchedChannelIds) {
-    const ch = channelMap.get(id);
-    if (!ch) continue;
-    if (!channelAllows(ch, { maxRisk: payload.maxRisk, verdict: payload.verdict, eventType: payload.eventType }))
-      continue;
-    targets.push(ch);
-  }
+  const targets = Array.from(matchedChannelIds)
+    .map((id) => channelMap.get(id))
+    .filter((c): c is NonNullable<typeof c> => Boolean(c))
+    .filter((c) => channelAllows(c, { maxRisk: payload.maxRisk, verdict: payload.verdict, eventType: payload.eventType }));
+
   if (targets.length === 0) return;
 
-  // Suppression → SKIPPED deliveries for audit
   const suppression = await getActiveSuppression(tenantId, hostname);
   if (suppression) {
     const reason = `suppressed_until=${suppression.mutedUntil.toISOString()} reason=${suppression.reason ?? "n/a"}`;
@@ -429,8 +357,10 @@ export async function notifyIncidentCreated(payload: IncidentCreatedPayload, opt
       });
 
       try {
+        const cfg = asRecord(ch.config);
+
         if (ch.type === "slack") {
-          const webhookUrl = getSlackWebhookUrl(ch.config as Prisma.JsonValue);
+          const webhookUrl = getString(cfg, "webhookUrl");
           if (!webhookUrl) {
             await updateDelivery(delivery.id, { status: "failed", lastError: "slack_failed invalid_config" });
             return;
@@ -440,77 +370,53 @@ export async function notifyIncidentCreated(payload: IncidentCreatedPayload, opt
           const res = await postJson(webhookUrl, msg);
 
           if (!res.ok) {
-            const errMsg = `slack_failed status=${res.status} body=${truncate(res.text, 300)}`.slice(0, 500);
+            const errMsg = `slack_failed status=${res.status} body=${res.text}`.slice(0, 500);
+            const nextAttemptAt = isTransientFailure(res.status) ? new Date(Date.now() + computeBackoffMs(1)) : null;
 
-            const nextAttemptAt = isTransientFailure(res.status)
-              ? new Date(Date.now() + computeBackoffMs(1))
-              : null;
-
-            await updateDelivery(delivery.id, {
-              status: "failed",
-              lastError: errMsg,
-              nextAttemptAt
-            });
+            await updateDelivery(delivery.id, { status: "failed", lastError: errMsg, nextAttemptAt });
 
             if (isPermanentFailure(res.status, res.text)) await maybeAutoDisableChannel(ch.id, errMsg);
             return;
           }
 
-          await updateDelivery(delivery.id, {
-            status: "sent",
-            sentAt: new Date(),
-            lastError: null,
-            nextAttemptAt: null
-          });
+          await updateDelivery(delivery.id, { status: "sent", sentAt: new Date(), lastError: null, nextAttemptAt: null });
           return;
         }
 
         if (ch.type === "webhook") {
-          const wh = getWebhookConfig(ch.config as Prisma.JsonValue);
-          if (!wh) {
+          const url = getString(cfg, "url");
+          const secret = getString(cfg, "secret");
+
+          if (!url) {
             await updateDelivery(delivery.id, { status: "failed", lastError: "webhook_failed invalid_config" });
             return;
           }
 
           const headers: Record<string, string> = {};
-          if (wh.secret && wh.secret.length >= 16) {
-            headers["x-threatpulse-signature"] = signWebhook(wh.secret, payload);
+          if (secret && secret.length >= 16) {
+            headers["x-threatpulse-signature"] = signWebhook(secret, payload);
           }
 
-          const res = await postJson(wh.url, { kind: "incident_created", payload }, headers);
+          const res = await postJson(url, { kind: "incident_created", payload }, headers);
 
           if (!res.ok) {
-            const errMsg = `webhook_failed status=${res.status} body=${truncate(res.text, 300)}`.slice(0, 500);
-            const nextAttemptAt = isTransientFailure(res.status)
-              ? new Date(Date.now() + computeBackoffMs(1))
-              : null;
+            const errMsg = `webhook_failed status=${res.status} body=${res.text}`.slice(0, 500);
+            const nextAttemptAt = isTransientFailure(res.status) ? new Date(Date.now() + computeBackoffMs(1)) : null;
 
-            await updateDelivery(delivery.id, {
-              status: "failed",
-              lastError: errMsg,
-              nextAttemptAt
-            });
+            await updateDelivery(delivery.id, { status: "failed", lastError: errMsg, nextAttemptAt });
 
             if (isPermanentFailure(res.status, res.text)) await maybeAutoDisableChannel(ch.id, errMsg);
             return;
           }
 
-          await updateDelivery(delivery.id, {
-            status: "sent",
-            sentAt: new Date(),
-            lastError: null,
-            nextAttemptAt: null
-          });
+          await updateDelivery(delivery.id, { status: "sent", sentAt: new Date(), lastError: null, nextAttemptAt: null });
           return;
         }
 
-        // Email: stub (future)
         await updateDelivery(delivery.id, { status: "failed", lastError: "email_failed not_implemented" });
-      } catch (err: any) {
-        await updateDelivery(delivery.id, {
-          status: "failed",
-          lastError: `send_failed ${truncate(String(err?.message ?? "unknown_error"), 300)}`.slice(0, 500)
-        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "unknown_error";
+        await updateDelivery(delivery.id, { status: "failed", lastError: `send_failed ${msg}`.slice(0, 500) });
       }
     })
   );
@@ -524,7 +430,6 @@ export async function notifyIncidentCreated(payload: IncidentCreatedPayload, opt
 export async function runDigestOnce(now = new Date()) {
   if (!alertsEnabled()) return;
 
-  // 60m window, worker runs every 5m by default
   const windowEnd = now;
   const windowStart = new Date(now.getTime() - 60 * 60_000);
 
@@ -557,33 +462,23 @@ export async function runDigestOnce(now = new Date()) {
       const matching = incidents.filter((i) => {
         const v = asIncidentVerdict(i.verdict);
         if (!v) return false;
-        return ruleMatches(rule, {
-          hostname: i.hostname,
-          maxRisk: i.maxRisk,
-          verdict: v,
-          // Digest is incident-based; treat as NAVIGATE for filtering unless you later add incident eventType
-          eventType: "NAVIGATE"
-        });
+        return ruleMatches(rule, { hostname: i.hostname, maxRisk: i.maxRisk, verdict: v, eventType: "NAVIGATE" });
       });
-
       if (matching.length === 0) continue;
 
       const blocks = matching.filter((m) => m.verdict === "block").length;
       const warns = matching.filter((m) => m.verdict === "warn").length;
 
-      const topHosts: DigestTopHost[] = matching
+      const topHosts: DigestHost[] = matching
         .slice()
         .sort((a, b) => b.maxRisk - a.maxRisk)
         .slice(0, 20)
-        .map((m) => {
-          const vv = asIncidentVerdict(m.verdict) ?? "warn"; // safe fallback (shouldn’t hit because we filtered)
-          return {
-            hostname: m.hostname,
-            verdict: vv,
-            maxRisk: m.maxRisk,
-            count: m.eventCount
-          };
-        });
+        .map((m) => ({
+          hostname: m.hostname,
+          verdict: (asIncidentVerdict(m.verdict) ?? "warn") as IncidentVerdict,
+          maxRisk: m.maxRisk,
+          count: m.eventCount
+        }));
 
       const digestPayload: DigestPayload = {
         tenantId,
@@ -592,12 +487,17 @@ export async function runDigestOnce(now = new Date()) {
         summary: { blocks, warns, topHosts }
       };
 
+      /**
+       * ✅ Fix #2: eliminate "Object is possibly 'undefined'"
+       * No direct `[0].prop` access.
+       */
+      const maxRisk = topHosts.length > 0 ? topHosts[0]!.maxRisk : 0;
+      const worstVerdict: IncidentVerdict = blocks > 0 ? "block" : "warn";
+
       for (const link of rule.channels ?? []) {
         const ch = channelMap.get(link.channelId);
         if (!ch) continue;
 
-        const maxRisk = topHosts[0]?.maxRisk ?? 0;
-        const worstVerdict: IncidentVerdict = blocks > 0 ? "block" : "warn";
         if (!channelAllows(ch, { maxRisk, verdict: worstVerdict, eventType: "NAVIGATE" })) continue;
 
         const delivery = await recordDelivery({
@@ -614,8 +514,10 @@ export async function runDigestOnce(now = new Date()) {
         });
 
         try {
+          const cfg = asRecord(ch.config);
+
           if (ch.type === "slack") {
-            const webhookUrl = getSlackWebhookUrl(ch.config as Prisma.JsonValue);
+            const webhookUrl = getString(cfg, "webhookUrl");
             if (!webhookUrl) {
               await updateDelivery(delivery.id, { status: "failed", lastError: "slack_failed invalid_config" });
               continue;
@@ -625,10 +527,8 @@ export async function runDigestOnce(now = new Date()) {
             const res = await postJson(webhookUrl, msg);
 
             if (!res.ok) {
-              const errMsg = `slack_failed status=${res.status} body=${truncate(res.text, 300)}`.slice(0, 500);
-              const nextAttemptAt = isTransientFailure(res.status)
-                ? new Date(Date.now() + computeBackoffMs(1))
-                : null;
+              const errMsg = `slack_failed status=${res.status} body=${res.text}`.slice(0, 500);
+              const nextAttemptAt = isTransientFailure(res.status) ? new Date(Date.now() + computeBackoffMs(1)) : null;
 
               await updateDelivery(delivery.id, { status: "failed", lastError: errMsg, nextAttemptAt });
               if (isPermanentFailure(res.status, res.text)) await maybeAutoDisableChannel(ch.id, errMsg);
@@ -640,24 +540,24 @@ export async function runDigestOnce(now = new Date()) {
           }
 
           if (ch.type === "webhook") {
-            const wh = getWebhookConfig(ch.config as Prisma.JsonValue);
-            if (!wh) {
+            const url = getString(cfg, "url");
+            const secret = getString(cfg, "secret");
+
+            if (!url) {
               await updateDelivery(delivery.id, { status: "failed", lastError: "webhook_failed invalid_config" });
               continue;
             }
 
             const headers: Record<string, string> = {};
-            if (wh.secret && wh.secret.length >= 16) {
-              headers["x-threatpulse-signature"] = signWebhook(wh.secret, digestPayload);
+            if (secret && secret.length >= 16) {
+              headers["x-threatpulse-signature"] = signWebhook(secret, digestPayload);
             }
 
-            const res = await postJson(wh.url, { kind: "incident_digest", payload: digestPayload }, headers);
+            const res = await postJson(url, { kind: "incident_digest", payload: digestPayload }, headers);
 
             if (!res.ok) {
-              const errMsg = `webhook_failed status=${res.status} body=${truncate(res.text, 300)}`.slice(0, 500);
-              const nextAttemptAt = isTransientFailure(res.status)
-                ? new Date(Date.now() + computeBackoffMs(1))
-                : null;
+              const errMsg = `webhook_failed status=${res.status} body=${res.text}`.slice(0, 500);
+              const nextAttemptAt = isTransientFailure(res.status) ? new Date(Date.now() + computeBackoffMs(1)) : null;
 
               await updateDelivery(delivery.id, { status: "failed", lastError: errMsg, nextAttemptAt });
               if (isPermanentFailure(res.status, res.text)) await maybeAutoDisableChannel(ch.id, errMsg);
@@ -669,11 +569,9 @@ export async function runDigestOnce(now = new Date()) {
           }
 
           await updateDelivery(delivery.id, { status: "failed", lastError: "unsupported_channel_for_digest" });
-        } catch (err: any) {
-          await updateDelivery(delivery.id, {
-            status: "failed",
-            lastError: `send_failed ${truncate(String(err?.message ?? "unknown_error"), 300)}`.slice(0, 500)
-          });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : "unknown_error";
+          await updateDelivery(delivery.id, { status: "failed", lastError: `send_failed ${msg}`.slice(0, 500) });
         }
       }
     }
@@ -689,10 +587,7 @@ export async function runRetryOnce(now = new Date()) {
   if (!alertsEnabled()) return;
 
   const due = await db.notificationDelivery.findMany({
-    where: {
-      status: "failed",
-      nextAttemptAt: { not: null, lte: now }
-    },
+    where: { status: "failed" as any, nextAttemptAt: { not: null, lte: now } },
     orderBy: { nextAttemptAt: "asc" },
     take: 50
   });
@@ -708,12 +603,14 @@ export async function runRetryOnce(now = new Date()) {
       const ch = channelMap.get(d.channelId);
       if (!ch || !ch.enabled) return;
 
-      const attempt = (typeof d.attemptCount === "number" ? d.attemptCount : 0) + 1;
+      const attempt = (d.attemptCount ?? 0) + 1;
       const nextAttemptAt = attempt >= 4 ? null : new Date(Date.now() + computeBackoffMs(attempt));
 
       try {
+        const cfg = asRecord(ch.config);
+
         if (ch.type === "slack") {
-          const webhookUrl = getSlackWebhookUrl(ch.config as Prisma.JsonValue);
+          const webhookUrl = getString(cfg, "webhookUrl");
           if (!webhookUrl) {
             await updateDelivery(d.id, {
               attemptCount: attempt,
@@ -724,18 +621,16 @@ export async function runRetryOnce(now = new Date()) {
             return;
           }
 
-          const kind = d.kind;
           const payload = d.payload as any;
-
           const msg =
-            kind === "incident_digest"
+            d.kind === "incident_digest"
               ? buildSlackMessageDigest(payload as DigestPayload)
               : buildSlackMessageIncident(payload as IncidentCreatedPayload);
 
           const res = await postJson(webhookUrl, msg);
 
           if (!res.ok) {
-            const errMsg = `slack_failed status=${res.status} body=${truncate(res.text, 300)}`.slice(0, 500);
+            const errMsg = `slack_failed status=${res.status} body=${res.text}`.slice(0, 500);
 
             await updateDelivery(d.id, {
               attemptCount: attempt,
@@ -749,7 +644,7 @@ export async function runRetryOnce(now = new Date()) {
           }
 
           await updateDelivery(d.id, {
-            status: "sent",
+            status: "sent" as any,
             sentAt: new Date(),
             attemptCount: attempt,
             lastAttemptAt: new Date(),
@@ -760,8 +655,10 @@ export async function runRetryOnce(now = new Date()) {
         }
 
         if (ch.type === "webhook") {
-          const wh = getWebhookConfig(ch.config as Prisma.JsonValue);
-          if (!wh) {
+          const url = getString(cfg, "url");
+          const secret = getString(cfg, "secret");
+
+          if (!url) {
             await updateDelivery(d.id, {
               attemptCount: attempt,
               lastAttemptAt: new Date(),
@@ -772,14 +669,14 @@ export async function runRetryOnce(now = new Date()) {
           }
 
           const headers: Record<string, string> = {};
-          if (wh.secret && wh.secret.length >= 16) {
-            headers["x-threatpulse-signature"] = signWebhook(wh.secret, d.payload);
+          if (secret && secret.length >= 16) {
+            headers["x-threatpulse-signature"] = signWebhook(secret, d.payload);
           }
 
-          const res = await postJson(wh.url, { kind: d.kind, payload: d.payload }, headers);
+          const res = await postJson(url, { kind: d.kind, payload: d.payload }, headers);
 
           if (!res.ok) {
-            const errMsg = `webhook_failed status=${res.status} body=${truncate(res.text, 300)}`.slice(0, 500);
+            const errMsg = `webhook_failed status=${res.status} body=${res.text}`.slice(0, 500);
 
             await updateDelivery(d.id, {
               attemptCount: attempt,
@@ -793,7 +690,7 @@ export async function runRetryOnce(now = new Date()) {
           }
 
           await updateDelivery(d.id, {
-            status: "sent",
+            status: "sent" as any,
             sentAt: new Date(),
             attemptCount: attempt,
             lastAttemptAt: new Date(),
@@ -809,11 +706,12 @@ export async function runRetryOnce(now = new Date()) {
           nextAttemptAt: null,
           lastError: "email_failed not_implemented"
         });
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "unknown_error";
         await updateDelivery(d.id, {
           attemptCount: attempt,
           lastAttemptAt: new Date(),
-          lastError: `retry_failed ${truncate(String(err?.message ?? "unknown_error"), 300)}`.slice(0, 500),
+          lastError: `retry_failed ${msg}`.slice(0, 500),
           nextAttemptAt
         });
       }

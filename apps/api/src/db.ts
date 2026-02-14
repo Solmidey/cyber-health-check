@@ -4,45 +4,33 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import pg from "pg";
 
 /**
- * Commandments:
- * - Secret management: use DATABASE_URL from env, never hardcode.
- * - Dependency hygiene: adapter-based Prisma v7 setup.
- * - Careful error handling: fail fast if DATABASE_URL missing.
- * - Safe logging: only warn/error.
- *
- * Notes:
- * - We use `pg` default import for best ESM/CJS compatibility under NodeNext/tsx.
- * - Install types: `pnpm add -D @types/pg`
- * - Generate Prisma client: `pnpm exec prisma generate`
+ * db.ts
+ * - Prisma + @prisma/adapter-pg for Postgres
+ * - Works in Node ESM ("type":"module")
+ * - Avoids multiple clients in dev/watch
  */
 
 const { Pool } = pg;
 
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  throw new Error("Missing DATABASE_URL in environment (.env).");
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  // Commandment: validation at boundary
+  throw new Error("DATABASE_URL is required");
 }
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  // Sensible defaults for a small API; tune later for production.
-  max: 10,
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 10_000
-});
-
+const pool = new Pool({ connectionString: databaseUrl });
 const adapter = new PrismaPg(pool);
 
-export const db = new PrismaClient({
-  adapter,
-  log: ["warn", "error"]
-});
+const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
 
-/**
- * Optional: graceful shutdown helper (nice for production & tests)
- * Easy to remove later if you don’t need it.
- */
-export async function closeDb(): Promise<void> {
-  await db.$disconnect();
-  await pool.end();
+// Reuse client in dev to prevent too many connections during tsx watch.
+export const db =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    adapter,
+    log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"]
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = db;
 }

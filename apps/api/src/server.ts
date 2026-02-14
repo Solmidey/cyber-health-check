@@ -6,7 +6,7 @@ import { z } from "zod";
 import "dotenv/config";
 import crypto from "node:crypto";
 import { db } from "./db.js";
-import { notifyIncidentCreated, validateChannelConfig } from "./notifications.js"; // NodeNext requires explicit extension
+import { notifyIncidentCreated } from "./notifications.js"; // NodeNext requires explicit extension
 
 /**
  * =========================
@@ -18,9 +18,11 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
+  // Commandment: secret management (never log; rotate in prod)
   TENANT_TOKEN_SECRET: z.string().min(20),
   DEVICE_TOKEN_SECRET: z.string().min(20),
 
+  // Commandment: strict CORS (lock down origins)
   DASHBOARD_ORIGIN: z.string().url(),
   EXTENSION_ORIGIN: z.string().optional()
 });
@@ -56,6 +58,17 @@ type TxClient = Parameters<TxCallback>[0];
 
 type Verdict = "allow" | "warn" | "block";
 
+/**
+ * =========================
+ * Helpers: crypto + auth token verification
+ * =========================
+ * Token format (HMAC):
+ *   base64url(payloadJson).base64url(hmacSHA256(payloadJson, secret))
+ *
+ * Commandment: strict authorization
+ * - Timing-safe signature comparisons
+ * - No token contents logged
+ */
 function timingSafeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
@@ -71,6 +84,7 @@ function verifyHmacToken<T>(token: string, secret: string): T | null {
   if (!payloadB64 || !sigB64) return null;
 
   const payloadJson = Buffer.from(payloadB64, "base64url").toString("utf8");
+
   const expectedSig = crypto.createHmac("sha256", secret).update(payloadJson).digest("base64url");
   if (!timingSafeEqual(expectedSig, sigB64)) return null;
 
@@ -81,6 +95,9 @@ function verifyHmacToken<T>(token: string, secret: string): T | null {
   }
 }
 
+/**
+ * Commandment: safe logging (avoid full URL incl. query).
+ */
 function safeUrlForLog(urlStr: string): string {
   try {
     const u = new URL(urlStr);
@@ -99,9 +116,45 @@ function requireAuth(req: FastifyRequest, reply: FastifyReply): AuthContext | nu
 }
 
 /**
+ * Normalize and validate hostnames (lightweight, no DNS).
+ * - lowercases
+ * - strips scheme/path if user pastes a URL
+ * - rejects whitespace / suspicious chars
+ */
+function normalizeHostname(input: string): string | null {
+  const raw = input.trim();
+  if (!raw) return null;
+
+  // If user pasted a URL, extract hostname.
+  try {
+    if (raw.includes("://")) {
+      const u = new URL(raw);
+      return u.hostname.toLowerCase();
+    }
+  } catch {
+    // ignore; fall back to raw
+  }
+
+  const host = raw.toLowerCase();
+
+  // basic sanity: no spaces, no slashes, no @, no port, no query
+  if (/[ \t\r\n/@?#]/.test(host)) return null;
+
+  // allow punycode + normal DNS-ish labels
+  if (!/^[a-z0-9.-]+$/.test(host)) return null;
+  if (host.length > 253) return null;
+
+  // must contain at least one dot (prevents "localhost" noise in prod dashboards)
+  if (!host.includes(".")) return null;
+
+  return host;
+}
+
+/**
  * =========================
  * Zod schemas
  * =========================
+ * Commandment: validation & sanitization at boundary
  */
 const reputationCheckBody = z.object({
   url: z.string().url(),
@@ -172,10 +225,16 @@ const testChannelBody = z.object({
 const deliveriesQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().optional(),
-  status: z.enum(["pending", "sent", "failed"]).optional(),
+  status: z.enum(["pending", "sent", "failed", "skipped"]).optional(),
   channelId: z.string().optional()
 });
 
+/**
+ * =========================
+ * Notification Rules schemas
+ * =========================
+ * Rules define "when", channels define "where".
+ */
 const ruleSchema = z.object({
   name: z.string().min(1),
   enabled: z.boolean().optional(),
@@ -195,20 +254,57 @@ const rulePatchSchema = ruleSchema.partial().extend({
   channelIds: z.array(z.string().min(1)).min(1).optional()
 });
 
+/**
+ * =========================
+ * Suppressions (Step 3)
+ * =========================
+ * Product move: “Mute this host for X minutes” with reason.
+ */
+const suppressionUpsertBody = z.object({
+  hostname: z.string().min(1),
+  minutes: z.number().int().min(5).max(30 * 24 * 60).default(60), // up to 30 days
+  reason: z.string().min(1).max(120).optional()
+});
+
+const suppressionsListQuery = z.object({
+  active: z
+    .union([z.literal("true"), z.literal("false")])
+    .optional()
+    .transform((v) => (v === "false" ? false : true))
+});
+
+const suppressionDeleteByIdParams = z.object({
+  id: z.string().min(1)
+});
+
+const suppressionDeleteByHostnameParams = z.object({
+  hostname: z.string().min(1)
+});
+
+/**
+ * Commandment: secret management — never return webhook URL / secrets to clients.
+ */
 function redactChannelForResponse(channel: any) {
   const cfg = channel.config ?? {};
-  const redactedConfig: Record<string, unknown> = { ...cfg };
+  const redactedConfig: Record<string, unknown> = { ...(typeof cfg === "object" && cfg ? cfg : {}) };
 
-  if (channel.type === "slack" && typeof cfg.webhookUrl === "string") redactedConfig.webhookUrl = "redacted";
-  if (channel.type === "webhook" && typeof cfg.secret === "string") redactedConfig.secret = "redacted";
+  if (channel.type === "slack" && typeof (cfg as any).webhookUrl === "string") {
+    redactedConfig.webhookUrl = "redacted";
+  }
+  if (channel.type === "webhook" && typeof (cfg as any).secret === "string") {
+    redactedConfig.secret = "redacted";
+  }
 
   return { ...channel, config: redactedConfig };
 }
 
 async function bootstrapDefaultRulesIfNeeded(tenantId: string, channelId: string) {
   /**
-   * If tenant has zero rules, bootstrap sensible defaults (top-tier onboarding).
-   * Easy removal: delete this function + call site.
+   * Top-tier onboarding:
+   * If a tenant creates their first channel and has no rules yet,
+   * auto-create two sensible defaults:
+   * - Block -> Alerts
+   * - Warn (>=70) -> Alerts
    */
   const existingRules = await db.notificationRule.count({ where: { tenantId } });
   if (existingRules > 0) return;
@@ -248,22 +344,37 @@ function createApp() {
   const app = Fastify({
     logger: {
       level: env.NODE_ENV === "production" ? "info" : "debug",
+      // Commandment: safe logging (never log secrets/tokens)
       redact: ["req.headers.authorization", "req.headers['x-tenant-token']", "req.headers['x-device-token']"]
     }
   });
 
+  /**
+   * =========================
+   * Security + platform basics
+   * =========================
+   */
   app.register(helmet);
 
   app.register(cors, {
     origin: (origin, cb) => {
+      // Allow non-browser tools like curl (no Origin header).
       if (!origin) return cb(null, true);
+
       const allowed = new Set<string>([env.DASHBOARD_ORIGIN]);
       if (env.EXTENSION_ORIGIN) allowed.add(env.EXTENSION_ORIGIN);
+
       cb(null, allowed.has(origin));
     },
     credentials: false
   });
 
+  /**
+   * =========================
+   * Rate limiting
+   * =========================
+   * Commandment: rate limiting and abuse protection.
+   */
   app.register(rateLimit, {
     global: true,
     max: 120,
@@ -271,8 +382,19 @@ function createApp() {
     keyGenerator: (req) => `${req.ip}`
   });
 
+  /**
+   * =========================
+   * Health (no auth)
+   * =========================
+   */
   app.get("/health", async () => ({ ok: true }));
 
+  /**
+   * =========================
+   * Auth preHandler for /v1/*
+   * =========================
+   * Commandment: strict authorization
+   */
   app.addHook("preHandler", async (req, reply) => {
     if (!req.url.startsWith("/v1/")) return;
 
@@ -286,14 +408,23 @@ function createApp() {
     const tenant = verifyHmacToken<TenantAuth>(tenantToken, env.TENANT_TOKEN_SECRET);
     const device = verifyHmacToken<DeviceAuth>(deviceToken, env.DEVICE_TOKEN_SECRET);
 
-    if (!tenant || !device) return reply.code(401).send({ error: "unauthorized" });
+    if (!tenant || !device) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
 
     req.auth = { tenant, device };
   });
 
+  /**
+   * =========================
+   * POST /v1/reputation/check
+   * =========================
+   */
   app.post("/v1/reputation/check", async (req, reply) => {
     const parsed = reputationCheckBody.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
 
     const { url, eventType } = parsed.data;
 
@@ -308,7 +439,9 @@ function createApp() {
     const reasons: string[] = [];
     let risk = 0;
 
-    // DEV-ONLY deterministic triggers
+    /**
+     * DEV-ONLY START: deterministic WARN/BLOCK triggers
+     */
     if (env.NODE_ENV !== "production") {
       const t = u.searchParams.get("chc-test");
       if (t === "warn") {
@@ -338,6 +471,7 @@ function createApp() {
     }
 
     const verdict: Verdict = risk >= 90 ? "block" : risk >= 60 ? "warn" : "allow";
+
     return reply.send({ risk, verdict, reasons, checked: { hostname, url } });
   });
 
@@ -363,17 +497,13 @@ function createApp() {
     if (!auth) return;
 
     const parsed = channelUpsertBody.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
 
     const body = parsed.data;
     const tenantId = auth.tenant.tenantId;
     const enabled = body.enabled ?? true;
-
-    // ✅ FAIL-FAST validation (top-tier UX + ops)
-    const validation = await validateChannelConfig(body.type, body.config);
-    if (!validation.ok) {
-      return reply.code(400).send({ error: "bad_request", message: validation.error });
-    }
 
     if (body.id) {
       const existing = await db.notificationChannel.findFirst({ where: { id: body.id, tenantId } });
@@ -385,7 +515,7 @@ function createApp() {
           enabled,
           name: body.name ?? null,
           type: body.type,
-          config: body.config,
+          config: body.config as any,
           filters: body.filters ?? undefined
         }
       });
@@ -399,12 +529,12 @@ function createApp() {
         enabled,
         name: body.name ?? null,
         type: body.type,
-        config: body.config,
+        config: body.config as any,
         filters: body.filters ?? undefined
       }
     });
 
-    // Bootstrap defaults (safe)
+    // ✅ Best-practice onboarding: create default rules if tenant has none
     try {
       await bootstrapDefaultRulesIfNeeded(tenantId, channel.id);
     } catch (err) {
@@ -467,7 +597,9 @@ function createApp() {
     if (!auth) return;
 
     const parsed = ruleSchema.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
 
     const tenantId = auth.tenant.tenantId;
     const body = parsed.data;
@@ -522,7 +654,9 @@ function createApp() {
     const id = (req.params as any).id as string;
 
     const parsed = rulePatchSchema.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
 
     const existing = await db.notificationRule.findFirst({ where: { id, tenantId } });
     if (!existing) return reply.code(404).send({ error: "not_found" });
@@ -593,43 +727,199 @@ function createApp() {
     return reply.send({ ok: true });
   });
 
+  /**
+   * =========================
+   * Notifications: Suppressions (Step 3)
+   * =========================
+   */
+  app.get("/v1/notifications/suppressions", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const q = suppressionsListQuery.safeParse(req.query);
+    if (!q.success) {
+      return reply.code(400).send({ error: "bad_request", details: q.error.flatten() });
+    }
+
+    const tenantId = auth.tenant.tenantId;
+    const activeOnly = q.data.active;
+    const now = new Date();
+
+    const rows = await db.notificationSuppression.findMany({
+      where: {
+        tenantId,
+        ...(activeOnly ? { mutedUntil: { gt: now } } : {})
+      },
+      orderBy: { mutedUntil: "desc" },
+      take: 200
+    });
+
+    return reply.send({
+      suppressions: rows.map((r) => ({
+        id: r.id,
+        hostname: r.hostname,
+        mutedUntil: r.mutedUntil,
+        reason: r.reason,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt
+      }))
+    });
+  });
+
+  app.post("/v1/notifications/suppressions", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const parsed = suppressionUpsertBody.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
+
+    const tenantId = auth.tenant.tenantId;
+
+    const normalized = normalizeHostname(parsed.data.hostname);
+    if (!normalized) {
+      return reply.code(400).send({ error: "bad_request", message: "invalid_hostname" });
+    }
+
+    const mutedUntil = new Date(Date.now() + parsed.data.minutes * 60_000);
+    const reason = parsed.data.reason ?? null;
+
+    const existing = await db.notificationSuppression.findFirst({ where: { tenantId, hostname: normalized } });
+
+    const row = existing
+      ? await db.notificationSuppression.update({
+          where: { id: existing.id },
+          data: { mutedUntil, reason }
+        })
+      : await db.notificationSuppression.create({
+          data: { tenantId, hostname: normalized, mutedUntil, reason }
+        });
+
+    return reply.send({
+      suppression: {
+        id: row.id,
+        hostname: row.hostname,
+        mutedUntil: row.mutedUntil,
+        reason: row.reason,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt
+      }
+    });
+  });
+
+  /**
+   * Prefer delete-by-id to avoid “hostname collisions” and to support future multi-host features.
+   */
+  app.delete("/v1/notifications/suppressions/id/:id", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const parsed = suppressionDeleteByIdParams.safeParse(req.params);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
+
+    const tenantId = auth.tenant.tenantId;
+
+    const row = await db.notificationSuppression.findFirst({ where: { id: parsed.data.id, tenantId } });
+    if (!row) return reply.code(404).send({ error: "not_found" });
+
+    await db.notificationSuppression.delete({ where: { id: row.id } });
+    return reply.send({ ok: true });
+  });
+
+  /**
+   * Backward-compatible delete by hostname (kept, but id route is preferred).
+   */
+  app.delete("/v1/notifications/suppressions/:hostname", async (req, reply) => {
+    const auth = requireAuth(req, reply);
+    if (!auth) return;
+
+    const parsed = suppressionDeleteByHostnameParams.safeParse(req.params);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
+
+    const tenantId = auth.tenant.tenantId;
+    const normalized = normalizeHostname(parsed.data.hostname);
+    if (!normalized) {
+      return reply.code(400).send({ error: "bad_request", message: "invalid_hostname" });
+    }
+
+    await db.notificationSuppression.deleteMany({ where: { tenantId, hostname: normalized } });
+    return reply.send({ ok: true });
+  });
+
+  /**
+   * =========================
+   * Notifications: Status (ops)
+   * =========================
+   */
   app.get("/v1/notifications/status", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const tenantId = auth.tenant.tenantId;
 
-    const [channelsTotal, channelsEnabled, rulesTotal, rulesEnabled, lastDelivery] = await Promise.all([
+    const now = new Date();
+    const since24h = new Date(Date.now() - 24 * 60 * 60_000);
+
+    const [
+      channelsTotal,
+      channelsEnabled,
+      channelsDisabled,
+      rulesTotal,
+      rulesEnabled,
+      suppressionsActive,
+      lastDelivery,
+      failed24h
+    ] = await Promise.all([
       db.notificationChannel.count({ where: { tenantId } }),
       db.notificationChannel.count({ where: { tenantId, enabled: true } }),
+      db.notificationChannel.count({ where: { tenantId, enabled: false } }),
       db.notificationRule.count({ where: { tenantId } }),
       db.notificationRule.count({ where: { tenantId, enabled: true } }),
-      db.notificationDelivery.findFirst({ where: { tenantId }, orderBy: { createdAt: "desc" } })
+      db.notificationSuppression.count({ where: { tenantId, mutedUntil: { gt: now } } }),
+      db.notificationDelivery.findFirst({ where: { tenantId }, orderBy: { createdAt: "desc" } }),
+      db.notificationDelivery.count({ where: { tenantId, status: "failed", createdAt: { gt: since24h } } })
     ]);
 
     return reply.send({
-      alertsEnabled: process.env.ALERTS_ENABLED === "true",
+      alertsEnabled: process.env.ALERTS_ENABLED === "true" || process.env.NOTIFICATIONS_ENABLED === "true",
       tenantId,
-      channels: { total: channelsTotal, enabled: channelsEnabled },
+      channels: { total: channelsTotal, enabled: channelsEnabled, disabled: channelsDisabled },
       rules: { total: rulesTotal, enabled: rulesEnabled },
+      suppressions: { active: suppressionsActive },
+      deliveries: { failedLast24h: failed24h },
       lastDelivery: lastDelivery
         ? {
             id: lastDelivery.id,
             channelId: lastDelivery.channelId,
             status: lastDelivery.status,
             lastError: lastDelivery.lastError,
-            createdAt: lastDelivery.createdAt
+            createdAt: lastDelivery.createdAt,
+            sentAt: lastDelivery.sentAt,
+            nextAttemptAt: lastDelivery.nextAttemptAt,
+            lastAttemptAt: lastDelivery.lastAttemptAt
           }
         : null
     });
   });
 
+  /**
+   * =========================
+   * Notifications: Deliveries (debug)
+   * =========================
+   */
   app.get("/v1/notifications/deliveries", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const parsed = deliveriesQuery.safeParse(req.query);
-    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
 
     const { limit, cursor, status, channelId } = parsed.data;
     const tenantId = auth.tenant.tenantId;
@@ -658,24 +948,35 @@ function createApp() {
         attemptCount: d.attemptCount,
         lastError: d.lastError,
         sentAt: d.sentAt,
-        createdAt: d.createdAt
+        createdAt: d.createdAt,
+        nextAttemptAt: d.nextAttemptAt,
+        lastAttemptAt: d.lastAttemptAt
       })),
       nextCursor
     });
   });
 
+  /**
+   * =========================
+   * Notifications: Test
+   * =========================
+   * Sends a test incident notification ONLY to the provided channelId.
+   */
   app.post("/v1/notifications/test", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const parsed = testChannelBody.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
 
     const tenantId = auth.tenant.tenantId;
 
     const channel = await db.notificationChannel.findFirst({
       where: { id: parsed.data.channelId, tenantId }
     });
+
     if (!channel) return reply.code(404).send({ error: "not_found" });
 
     try {
@@ -689,7 +990,7 @@ function createApp() {
           firstSeenAt: new Date(),
           eventType: "DOWNLOAD"
         },
-        { onlyChannelId: channel.id, reason: "test" }
+        { onlyChannelId: channel.id }
       );
     } catch (err) {
       req.log.warn({ err }, "notification_test_failed");
@@ -699,12 +1000,19 @@ function createApp() {
     return reply.send({ ok: true });
   });
 
+  /**
+   * =========================
+   * POST /v1/events
+   * =========================
+   */
   app.post("/v1/events", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
 
     const parsed = eventBody.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
 
     const { type, url, ts } = parsed.data;
     const { tenant, device } = auth;
@@ -861,6 +1169,11 @@ function createApp() {
     });
   });
 
+  /**
+   * =========================
+   * GET /v1/incidents
+   * =========================
+   */
   app.get("/v1/incidents", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
@@ -874,6 +1187,11 @@ function createApp() {
     return reply.send({ incidents });
   });
 
+  /**
+   * =========================
+   * GET /v1/events/recent
+   * =========================
+   */
   app.get("/v1/events/recent", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
@@ -887,6 +1205,12 @@ function createApp() {
     return reply.send({ events });
   });
 
+  /**
+   * =========================
+   * Central error handler
+   * =========================
+   * Commandment: careful error handling (no stack leaks).
+   */
   app.setErrorHandler((err, req, reply) => {
     req.log.error({ err, url: safeUrlForLog(req.url) }, "request_error");
     reply.code(500).send({ error: "internal_error" });

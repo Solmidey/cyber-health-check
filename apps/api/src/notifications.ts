@@ -1,20 +1,21 @@
 import "dotenv/config";
+import crypto from "node:crypto";
 import { db } from "./db.js";
-import type { Prisma } from "@prisma/client";
 
 /**
  * ============================================================
- * Notifications (Top-tier MVP)
+ * notifications.ts
  * ============================================================
- * Decisions:
- * - Slack = Incoming Webhook
- * - Validate channel config on save (fail-fast)
- * - Auto-disable permanently broken Slack channels (no retry storms)
+ * Immediate incident notifications (called by server.ts)
+ *
+ * Supported channels:
+ * - slack   (Incoming Webhook)
+ * - webhook (generic webhook + optional signature)
+ * - email   (stub)
  *
  * Commandments:
- * - Secret management: never return webhook URLs/secrets to clients
- * - Careful error handling: notifications never block ingestion
- * - Safe logging: never log webhook URLs/tokens
+ * - Secret management: never log webhook URLs or secrets.
+ * - Safe logging: store short error summaries in DB.
  */
 
 export type IncidentCreatedPayload = {
@@ -27,370 +28,304 @@ export type IncidentCreatedPayload = {
   eventType: "NAVIGATE" | "DOWNLOAD";
 };
 
-export type NotifyOptions = {
-  onlyChannelId?: string;
-  reason?: string; // e.g. "test"
+type NotifyOptions = { onlyChannelId?: string };
+
+type ChannelType = "slack" | "webhook" | "email";
+type DeliveryStatus = "pending" | "sent" | "failed" | "skipped";
+
+type ChannelRecord = {
+  id: string;
+  tenantId: string;
+  type: ChannelType;
+  enabled: boolean;
+  config: unknown;
+  filters: unknown | null;
 };
 
-type JsonObject = { [k: string]: Prisma.JsonValue };
+type SlackBlock =
+  | { type: "header"; text: { type: "plain_text"; text: string } }
+  | {
+      type: "section";
+      text?: { type: "mrkdwn"; text: string };
+      fields?: Array<{ type: "mrkdwn"; text: string }>;
+    };
 
-type SlackConfig = { webhookUrl: string };
-type WebhookConfig = { url: string; secret?: string };
-type EmailConfig = { to: string; from?: string };
-
-function isJsonObject(v: Prisma.JsonValue): v is JsonObject {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function getSlackConfig(config: Prisma.JsonValue): SlackConfig | null {
-  if (!isJsonObject(config)) return null;
-  const w = config["webhookUrl"];
-  if (typeof w !== "string") return null;
-  return { webhookUrl: w };
-}
-
-function getWebhookConfig(config: Prisma.JsonValue): WebhookConfig | null {
-  if (!isJsonObject(config)) return null;
-  const url = config["url"];
-  if (typeof url !== "string") return null;
-  const secretVal = config["secret"];
-  const secret = typeof secretVal === "string" ? secretVal : undefined;
-  return { url, secret };
-}
-
-function getEmailConfig(config: Prisma.JsonValue): EmailConfig | null {
-  if (!isJsonObject(config)) return null;
-  const to = config["to"];
-  if (typeof to !== "string") return null;
-  const fromVal = config["from"];
-  const from = typeof fromVal === "string" ? fromVal : undefined;
-  return { to, from };
-}
-
-function truncate(s: string, n: number) {
-  return s.length > n ? `${s.slice(0, n)}…` : s;
+function alertsEnabled(): boolean {
+  return process.env.ALERTS_ENABLED === "true" || process.env.NOTIFICATIONS_ENABLED === "true";
 }
 
 /**
- * Feature flag kill-switch.
+ * attemptCount starts at 1
+ * This version avoids any array-index undefined type issues entirely.
  */
-export function alertsEnabled(): boolean {
-  return process.env.ALERTS_ENABLED === "true";
+function computeBackoffMs(attemptCount: number): number {
+  if (attemptCount <= 1) return 60_000;
+  if (attemptCount === 2) return 5 * 60_000;
+  if (attemptCount === 3) return 30 * 60_000;
+  return 2 * 60 * 60_000; // 2h for 4+
 }
 
-/**
- * Optional global mute window (keeps your "suppressed_until" behavior).
- */
-function alertsMutedUntil(): Date | null {
-  const raw = process.env.ALERTS_MUTE_UNTIL;
-  if (!raw) return null;
-  const d = new Date(raw);
-  return Number.isNaN(d.getTime()) ? null : d;
+function isPermanentFailure(status: number, body: string): boolean {
+  if (status === 403 && body.includes("invalid_token")) return true;
+  if (status === 401) return true;
+  if (status === 404) return true;
+  if (status === 405) return true;
+  return false;
 }
 
-function slackWebhookPayload(incident: IncidentCreatedPayload) {
-  const title = incident.verdict === "block" ? "🛑 BLOCKED" : "⚠️ WARN";
-  const reasons = incident.reasons?.length ? incident.reasons.join(", ") : "none";
-  const when = incident.firstSeenAt.toISOString();
+function isTransientFailure(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+async function postJson(
+  url: string,
+  body: unknown,
+  headers?: Record<string, string>
+): Promise<{ ok: boolean; status: number; text: string }> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(headers ?? {}) },
+    body: JSON.stringify(body)
+  });
+  const text = await res.text().catch(() => "");
+  return { ok: res.ok, status: res.status, text };
+}
+
+function signWebhook(secret: string, payload: unknown): string {
+  const raw = JSON.stringify(payload);
+  return crypto.createHmac("sha256", secret).update(raw).digest("hex");
+}
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+function getString(obj: Record<string, unknown> | null, key: string): string | null {
+  if (!obj) return null;
+  const v = obj[key];
+  return typeof v === "string" ? v : null;
+}
+
+function channelAllows(
+  channel: { filters: unknown; enabled: boolean },
+  ctx: { maxRisk: number; verdict: "warn" | "block"; eventType: "NAVIGATE" | "DOWNLOAD" }
+): boolean {
+  if (!channel.enabled) return false;
+
+  const f = asRecord(channel.filters);
+  if (!f) return true;
+
+  const minRisk = f["minRisk"];
+  if (typeof minRisk === "number" && ctx.maxRisk < minRisk) return false;
+
+  const verdicts = f["verdicts"];
+  if (Array.isArray(verdicts) && verdicts.length > 0) {
+    if (!verdicts.includes(ctx.verdict)) return false;
+  }
+
+  const eventTypes = f["eventTypes"];
+  if (Array.isArray(eventTypes) && eventTypes.length > 0) {
+    if (!eventTypes.includes(ctx.eventType)) return false;
+  }
+
+  return true;
+}
+
+function buildSlackMessageIncident(payload: IncidentCreatedPayload): { text: string; blocks: SlackBlock[] } {
+  const title = payload.verdict === "block" ? "🚫 Blocked" : "⚠️ Warned";
+  const when = payload.firstSeenAt.toISOString();
 
   return {
-    text:
-      `${title} ThreatPulse alert\n` +
-      `• Host: ${incident.hostname}\n` +
-      `• Risk: ${incident.maxRisk}\n` +
-      `• Event: ${incident.eventType}\n` +
-      `• Reasons: ${truncate(reasons, 240)}\n` +
-      `• First seen: ${when}`
+    text: `${title}: ${payload.hostname} (risk ${payload.maxRisk})`,
+    blocks: [
+      { type: "header", text: { type: "plain_text", text: `${title}: ${payload.hostname}` } },
+      {
+        type: "section",
+        fields: [
+          { type: "mrkdwn", text: `*Risk:* ${payload.maxRisk}` },
+          { type: "mrkdwn", text: `*Verdict:* ${payload.verdict}` },
+          { type: "mrkdwn", text: `*Event:* ${payload.eventType}` },
+          { type: "mrkdwn", text: `*First seen:* ${when}` }
+        ]
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: payload.reasons?.length ? `*Reasons:* ${payload.reasons.join(", ")}` : "*Reasons:* (none)"
+        }
+      }
+    ]
   };
 }
 
-async function sendSlackWebhook(webhookUrl: string, incident: IncidentCreatedPayload) {
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(slackWebhookPayload(incident))
-  });
-
-  const body = await res.text().catch(() => "");
-  if (!res.ok) {
-    throw new Error(`slack_failed status=${res.status} body=${truncate(body, 200)}`);
-  }
-}
-
-async function sendGenericWebhook(url: string, secret: string | undefined, incident: IncidentCreatedPayload) {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (secret) headers["x-webhook-secret"] = secret;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      kind: "incident_created",
-      incident: {
-        tenantId: incident.tenantId,
-        hostname: incident.hostname,
-        verdict: incident.verdict,
-        maxRisk: incident.maxRisk,
-        reasons: incident.reasons,
-        firstSeenAt: incident.firstSeenAt,
-        eventType: incident.eventType
-      }
-    })
-  });
-
-  const body = await res.text().catch(() => "");
-  if (!res.ok) {
-    throw new Error(`webhook_failed status=${res.status} body=${truncate(body, 200)}`);
-  }
-}
-
-function channelPassesFilters(channel: any, incident: IncidentCreatedPayload): boolean {
-  const filters = channel.filters ?? null;
-  if (!filters) return true;
-
-  if (typeof filters.minRisk === "number" && incident.maxRisk < filters.minRisk) return false;
-
-  if (Array.isArray(filters.verdicts) && filters.verdicts.length > 0) {
-    if (!filters.verdicts.includes(incident.verdict)) return false;
-  }
-
-  if (Array.isArray(filters.eventTypes) && filters.eventTypes.length > 0) {
-    if (!filters.eventTypes.includes(incident.eventType)) return false;
-  }
-
-  return true;
-}
-
-function ruleMatchesIncident(rule: any, incident: IncidentCreatedPayload): boolean {
-  if (!rule.enabled) return false;
-
-  if (typeof rule.minRisk === "number" && incident.maxRisk < rule.minRisk) return false;
-
-  if (Array.isArray(rule.verdicts) && rule.verdicts.length > 0) {
-    if (!rule.verdicts.includes(incident.verdict)) return false;
-  }
-
-  if (Array.isArray(rule.eventTypes) && rule.eventTypes.length > 0) {
-    if (!rule.eventTypes.includes(incident.eventType)) return false;
-  }
-
-  if (Array.isArray(rule.hostDeny) && rule.hostDeny.includes(incident.hostname)) return false;
-
-  if (Array.isArray(rule.hostAllow) && rule.hostAllow.length > 0) {
-    if (!rule.hostAllow.includes(incident.hostname)) return false;
-  }
-
-  return true;
-}
-
-/**
- * Auto-disable on permanent Slack auth/config errors (ops-quality).
- */
-async function maybeDisableChannelOnPermanentError(channelId: string, errMsg: string) {
-  const permanent =
-    errMsg.includes("invalid_token") ||
-    errMsg.includes("invalid_auth") ||
-    errMsg.includes("account_inactive") ||
-    errMsg.includes("not_authed") ||
-    errMsg.includes("token_revoked");
-
-  if (!permanent) return;
-
-  await db.notificationChannel.update({
-    where: { id: channelId },
-    data: { enabled: false }
+async function recordDelivery(args: {
+  tenantId: string;
+  channelId: string;
+  kind: string;
+  status: DeliveryStatus;
+  attemptCount: number;
+  lastError: string | null;
+  payload: unknown;
+  sentAt: Date | null;
+  nextAttemptAt: Date | null;
+  lastAttemptAt: Date | null;
+}) {
+  return db.notificationDelivery.create({
+    data: {
+      tenantId: args.tenantId,
+      channelId: args.channelId,
+      kind: args.kind,
+      status: args.status as any,
+      attemptCount: args.attemptCount,
+      lastError: args.lastError,
+      payload: args.payload as any,
+      sentAt: args.sentAt,
+      nextAttemptAt: args.nextAttemptAt,
+      lastAttemptAt: args.lastAttemptAt
+    }
   });
 }
 
-/**
- * ============================================================
- * Public: notifyIncidentCreated
- * ============================================================
- */
-export async function notifyIncidentCreated(incident: IncidentCreatedPayload, opts: NotifyOptions = {}) {
+async function updateDelivery(id: string, data: Record<string, unknown>) {
+  return db.notificationDelivery.update({ where: { id }, data: data as any });
+}
+
+async function maybeAutoDisableChannel(channelId: string, reason: string) {
+  const failures = await db.notificationDelivery.count({
+    where: {
+      channelId,
+      status: "failed" as any,
+      createdAt: { gt: new Date(Date.now() - 24 * 60 * 60_000) }
+    }
+  });
+
+  if (failures < 5) return;
+
+  await db.notificationChannel.update({ where: { id: channelId }, data: { enabled: false } });
+
+  const ch = await db.notificationChannel.findUnique({ where: { id: channelId }, select: { tenantId: true } });
+  if (!ch) return;
+
+  await db.notificationDelivery.create({
+    data: {
+      tenantId: ch.tenantId,
+      channelId,
+      kind: "channel_disabled",
+      status: "sent" as any,
+      attemptCount: 0,
+      lastError: reason.slice(0, 300),
+      payload: { reason } as any,
+      sentAt: new Date(),
+      nextAttemptAt: null,
+      lastAttemptAt: new Date()
+    }
+  });
+}
+
+export async function notifyIncidentCreated(payload: IncidentCreatedPayload, opts?: NotifyOptions) {
   if (!alertsEnabled()) return;
 
-  const muteUntil = alertsMutedUntil();
-  if (muteUntil && new Date() < muteUntil) {
-    const channels = await db.notificationChannel.findMany({
-      where: {
-        tenantId: incident.tenantId,
-        enabled: true,
-        ...(opts.onlyChannelId ? { id: opts.onlyChannelId } : {})
-      },
-      select: { id: true }
-    });
+  const tenantId = payload.tenantId;
 
-    if (channels.length) {
-      await db.notificationDelivery.createMany({
-        data: channels.map((c) => ({
-          tenantId: incident.tenantId,
-          channelId: c.id,
-          kind: "incident_created",
-          status: "skipped" as any,
-          attemptCount: 0,
-          lastError: `suppressed_until=${muteUntil.toISOString()} reason=${opts.reason ?? "mute"}`,
-          payload: incident as any
-        }))
-      });
-    }
-    return;
-  }
-
-  const channels = await db.notificationChannel.findMany({
-    where: {
-      tenantId: incident.tenantId,
-      enabled: true,
-      ...(opts.onlyChannelId ? { id: opts.onlyChannelId } : {})
-    }
+  const channelsRaw = await db.notificationChannel.findMany({
+    where: { tenantId, enabled: true },
+    orderBy: { createdAt: "desc" }
   });
 
-  if (!channels.length) return;
+  const only = opts?.onlyChannelId ? new Set([opts.onlyChannelId]) : null;
 
-  const rules = await db.notificationRule.findMany({
-    where: { tenantId: incident.tenantId, enabled: true },
-    include: { channels: true }
-  });
-
-  let targetChannelIds: string[] = [];
-
-  if (rules.length > 0) {
-    const matched = new Set<string>();
-    for (const rule of rules) {
-      if (!ruleMatchesIncident(rule, incident)) continue;
-      for (const link of rule.channels) matched.add(link.channelId);
-    }
-    targetChannelIds = [...matched];
-  } else {
-    targetChannelIds = channels.filter((c) => channelPassesFilters(c, incident)).map((c) => c.id);
-  }
-
-  if (opts.onlyChannelId) targetChannelIds = targetChannelIds.filter((id) => id === opts.onlyChannelId);
-  if (!targetChannelIds.length) return;
-
-  await db.notificationDelivery.createMany({
-    data: targetChannelIds.map((channelId) => ({
-      tenantId: incident.tenantId,
-      channelId,
-      kind: "incident_created",
-      status: "pending",
-      attemptCount: 0,
-      payload: incident as any
+  const channels: ChannelRecord[] = channelsRaw
+    .map((c) => ({
+      id: c.id,
+      tenantId: c.tenantId,
+      type: c.type as ChannelType,
+      enabled: c.enabled,
+      config: c.config as unknown,
+      filters: (c as any).filters ?? null
     }))
-  });
+    .filter((c) => (only ? only.has(c.id) : true))
+    .filter((c) => channelAllows(c, { maxRisk: payload.maxRisk, verdict: payload.verdict, eventType: payload.eventType }));
 
-  const pending = await db.notificationDelivery.findMany({
-    where: { tenantId: incident.tenantId, kind: "incident_created", status: "pending" },
-    orderBy: { createdAt: "desc" },
-    take: targetChannelIds.length
-  });
+  if (channels.length === 0) return;
 
-  const channelById = new Map(channels.map((c) => [c.id, c]));
-
-  for (const d of pending) {
-    const channel = channelById.get(d.channelId);
-    if (!channel) continue;
-
-    const attemptAt = new Date();
-
-    try {
-      if (channel.type === "slack") {
-        const slackCfg = getSlackConfig(channel.config as Prisma.JsonValue);
-        if (!slackCfg) throw new Error("slack_config_missing_webhookUrl");
-        await sendSlackWebhook(slackCfg.webhookUrl, incident);
-      } else if (channel.type === "webhook") {
-        const whCfg = getWebhookConfig(channel.config as Prisma.JsonValue);
-        if (!whCfg) throw new Error("webhook_config_missing_url");
-        await sendGenericWebhook(whCfg.url, whCfg.secret, incident);
-      } else if (channel.type === "email") {
-        const emailCfg = getEmailConfig(channel.config as Prisma.JsonValue);
-        if (!emailCfg) throw new Error("email_config_invalid");
-        throw new Error("email_not_implemented");
-      } else {
-        throw new Error(`unsupported_channel_type_${String(channel.type)}`);
-      }
-
-      await db.notificationDelivery.update({
-        where: { id: d.id },
-        data: {
-          status: "sent",
-          attemptCount: { increment: 1 },
-          lastError: null,
-          sentAt: new Date(),
-          lastAttemptAt: attemptAt as any,
-          nextAttemptAt: null as any
-        } as any
+  await Promise.all(
+    channels.map(async (channel) => {
+      const delivery = await recordDelivery({
+        tenantId,
+        channelId: channel.id,
+        kind: "incident_created",
+        status: "pending",
+        attemptCount: 1,
+        lastError: null,
+        payload,
+        sentAt: null,
+        nextAttemptAt: null,
+        lastAttemptAt: new Date()
       });
-    } catch (err: any) {
-      const msg = err?.message ? String(err.message) : "send_failed";
 
       try {
-        await maybeDisableChannelOnPermanentError(d.channelId, msg);
-      } catch {
-        // ignore
+        const configObj = asRecord(channel.config);
+
+        if (channel.type === "slack") {
+          const webhookUrl = getString(configObj, "webhookUrl");
+          if (!webhookUrl) {
+            await updateDelivery(delivery.id, { status: "failed", lastError: "slack_failed invalid_config" });
+            return;
+          }
+
+          const msg = buildSlackMessageIncident(payload);
+          const res = await postJson(webhookUrl, msg);
+
+          if (!res.ok) {
+            const errMsg = `slack_failed status=${res.status} body=${res.text}`.slice(0, 500);
+            const nextAttemptAt = isTransientFailure(res.status) ? new Date(Date.now() + computeBackoffMs(1)) : null;
+
+            await updateDelivery(delivery.id, { status: "failed", lastError: errMsg, nextAttemptAt });
+
+            if (isPermanentFailure(res.status, res.text)) await maybeAutoDisableChannel(channel.id, errMsg);
+            return;
+          }
+
+          await updateDelivery(delivery.id, { status: "sent", sentAt: new Date(), lastError: null, nextAttemptAt: null });
+          return;
+        }
+
+        if (channel.type === "webhook") {
+          const url = getString(configObj, "url");
+          const secret = getString(configObj, "secret");
+
+          if (!url) {
+            await updateDelivery(delivery.id, { status: "failed", lastError: "webhook_failed invalid_config" });
+            return;
+          }
+
+          const headers: Record<string, string> = {};
+          if (secret && secret.length >= 16) {
+            headers["x-threatpulse-signature"] = signWebhook(secret, payload);
+          }
+
+          const res = await postJson(url, { kind: "incident_created", payload }, headers);
+
+          if (!res.ok) {
+            const errMsg = `webhook_failed status=${res.status} body=${res.text}`.slice(0, 500);
+            const nextAttemptAt = isTransientFailure(res.status) ? new Date(Date.now() + computeBackoffMs(1)) : null;
+
+            await updateDelivery(delivery.id, { status: "failed", lastError: errMsg, nextAttemptAt });
+
+            if (isPermanentFailure(res.status, res.text)) await maybeAutoDisableChannel(channel.id, errMsg);
+            return;
+          }
+
+          await updateDelivery(delivery.id, { status: "sent", sentAt: new Date(), lastError: null, nextAttemptAt: null });
+          return;
+        }
+
+        await updateDelivery(delivery.id, { status: "failed", lastError: "email_failed not_implemented" });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "unknown_error";
+        await updateDelivery(delivery.id, { status: "failed", lastError: `send_failed ${msg}`.slice(0, 500) });
       }
-
-      await db.notificationDelivery.update({
-        where: { id: d.id },
-        data: {
-          status: "failed",
-          attemptCount: { increment: 1 },
-          lastError: msg,
-          sentAt: null,
-          lastAttemptAt: attemptAt as any,
-          nextAttemptAt: null as any
-        } as any
-      });
-    }
-  }
-}
-
-/**
- * ============================================================
- * Public: validateChannelConfig (fail-fast on save)
- * ============================================================
- */
-export async function validateChannelConfig(type: string, config: any) {
-  if (type === "slack") {
-    const webhookUrl = config?.webhookUrl;
-    if (typeof webhookUrl !== "string" || !webhookUrl.startsWith("https://hooks.slack.com/")) {
-      return { ok: false as const, error: "invalid_slack_webhookUrl" as const };
-    }
-
-    const res = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: "✅ ThreatPulse: Slack channel connected." })
-    });
-
-    const body = await res.text().catch(() => "");
-    if (!res.ok) {
-      return {
-        ok: false as const,
-        error: `slack_failed status=${res.status} body=${truncate(body, 200)}` as const
-      };
-    }
-
-    return { ok: true as const };
-  }
-
-  if (type === "webhook") {
-    const url = config?.url;
-    if (typeof url !== "string") return { ok: false as const, error: "invalid_webhook_url" as const };
-
-    try {
-      const res = await fetch(url, { method: "HEAD" });
-      if (res.status === 405) return { ok: true as const };
-      if (res.ok) return { ok: true as const };
-      return { ok: false as const, error: `webhook_failed status=${res.status}` as const };
-    } catch {
-      return { ok: false as const, error: "webhook_unreachable" as const };
-    }
-  }
-
-  if (type === "email") {
-    return { ok: true as const };
-  }
-
-  return { ok: false as const, error: "unsupported_channel_type" as const };
+    })
+  );
 }

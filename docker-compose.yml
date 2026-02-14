@@ -2,18 +2,91 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: chc
-      POSTGRES_PASSWORD: chc_dev_password
-      POSTGRES_DB: chc
+      POSTGRES_USER: ${POSTGRES_USER:-chc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chc_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-chc}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chc} -d ${POSTGRES_DB:-chc}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ✅ One-shot migrations runner
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /work/apps/api
+    environment:
+      NODE_ENV: production
+      # ✅ do NOT hardcode secrets/URLs in git
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["pnpm", "prisma:migrate"]
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /work/apps/api
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: ${PORT:-4000}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      # toggle alerts/notifications for worker + server hooks
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-"true"}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-"true"}
+      # If these are required by server.ts, keep them out of git and provide via .env
+      TENANT_TOKEN_SECRET: ${TENANT_TOKEN_SECRET:?TENANT_TOKEN_SECRET is required}
+      DEVICE_TOKEN_SECRET: ${DEVICE_TOKEN_SECRET:?DEVICE_TOKEN_SECRET is required}
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:?DASHBOARD_ORIGIN is required}
+      EXTENSION_ORIGIN: ${EXTENSION_ORIGIN:-}
+    ports:
+      - "${PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["pnpm", "start"]
+    restart: unless-stopped
+
+  alerts-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /work/apps/api
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-"true"}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-"true"}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["pnpm", "start:worker"]
+    restart: unless-stopped
 
 volumes:
   pgdata:

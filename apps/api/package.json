@@ -4,7 +4,14 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm exec tsx watch src/server.ts",
-    "worker": "pnpm exec tsx watch src/worker.ts"
+    "worker": "pnpm exec tsx watch src/worker.ts",
+
+    "start": "pnpm exec tsx src/server.ts",
+    "start:worker": "pnpm exec tsx src/worker.ts",
+
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@fastify/cors": "^11.2.0",
